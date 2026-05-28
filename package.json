@@ -1,0 +1,14 @@
+{
+  "name": "aoe-onchain-buy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "buy:aoe:onchain": "node scripts/aoe-onchain-buy.js",
+    "test:aoe:roundtrip": "node scripts/aoe-roundtrip-test.js",
+    "dashboard:api": "node scripts/aoe-dashboard-server.js"
+  },
+  "dependencies": {
+    "viem": "^2.31.0"
+  }
+}

@@ -1,0 +1,485 @@
+import fs from "node:fs";
+import {
+  createPublicClient,
+  createWalletClient,
+  encodeAbiParameters,
+  fallback,
+  formatUnits,
+  http,
+  parseUnits,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { bsc } from "viem/chains";
+
+function loadDotEnv(path = ".env") {
+  if (!fs.existsSync(path)) return;
+  const lines = fs.readFileSync(path, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const index = trimmed.indexOf("=");
+    if (index === -1) continue;
+    const key = trimmed.slice(0, index).trim();
+    const value = trimmed.slice(index + 1).trim().replace(/^["']|["']$/g, "");
+    if (!process.env[key]) process.env[key] = value;
+  }
+}
+
+loadDotEnv();
+
+const OFFICIAL_BSC_RPC_URLS = [
+  "https://bsc-dataseed.bnbchain.org",
+  "https://bsc-dataseed-public.bnbchain.org",
+  "https://bsc-dataseed.nariox.org",
+  "https://bsc-dataseed.defibit.io",
+  "https://bsc-dataseed.ninicoin.io",
+];
+
+function rpcCandidates() {
+  const configured = (process.env.BSC_RPC_URLS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return [...new Set([process.env.BSC_RPC_URL, ...configured, ...OFFICIAL_BSC_RPC_URLS].filter(Boolean))];
+}
+
+const config = {
+  graphqlUrl: process.env.GRAPHQL_URL || "https://ft.42.space/v1/graphql",
+  rpcUrls: rpcCandidates(),
+  privateKey: process.env.PRIVATE_KEY,
+  marketAddress:
+    process.env.MARKET_ADDRESS || "0xfFb5Ce7060E6CE733EaBcb984dA7B47a721184bd",
+  targetOutcome: process.env.TARGET_OUTCOME || "AOE",
+  targetTokenId: BigInt(process.env.TARGET_TOKEN_ID || "4"),
+  buyAmount: process.env.BUY_AMOUNT_USDT || "10",
+  dryRun: process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true",
+  dryRunMaxWaitMs: Number(process.env.DRY_RUN_MAX_WAIT_MS || "10000"),
+  pollMs: Number(process.env.POLL_MS || "500"),
+  maxPrice: Number(process.env.MAX_PRICE || "0.0015"),
+  slippageBps: BigInt(process.env.SLIPPAGE_BPS || "200"),
+  collateral: "0x55d398326f99059ff775485246999027b3197955",
+  router: "0x888888886619275d33c00D3BC62DF94D700DCD42",
+  lens: "0x8aF85927Cb4deBE57C47DDE5cdb4665839f55a32",
+  integrator: "0xc60E3415648684b1D0D0D97e85CB21E6a2bCb620",
+  integratorFeeBps: 40n,
+  collateralDecimals: 18,
+  otDecimals: 18,
+};
+
+const erc20Abi = [
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ type: "bool" }],
+  },
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
+];
+
+const lensAbi = [
+  {
+    type: "function",
+    name: "simulateMint",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "market", type: "address" },
+      { name: "tokenId", type: "uint256" },
+      { name: "amount", type: "uint256" },
+      { name: "isExactIn", type: "bool" },
+      { name: "dataSwap", type: "bytes" },
+      { name: "dataGuess", type: "bytes" },
+      { name: "integratorFeeBps", type: "uint256" },
+    ],
+    outputs: [
+      {
+        name: "pre",
+        type: "tuple",
+        components: [
+          { name: "tokenId", type: "uint256" },
+          { name: "price", type: "uint256" },
+          { name: "supply", type: "uint256" },
+          { name: "totalMarketCap", type: "uint256" },
+          { name: "payoutPerOt", type: "uint256" },
+          { name: "marketCap", type: "uint256" },
+        ],
+      },
+      {
+        name: "post",
+        type: "tuple",
+        components: [
+          { name: "tokenId", type: "uint256" },
+          { name: "price", type: "uint256" },
+          { name: "supply", type: "uint256" },
+          { name: "totalMarketCap", type: "uint256" },
+          { name: "payoutPerOt", type: "uint256" },
+          { name: "marketCap", type: "uint256" },
+        ],
+      },
+      {
+        name: "quote",
+        type: "tuple",
+        components: [
+          { name: "collateralFromUser", type: "uint256" },
+          { name: "collateralToTreasury", type: "uint256" },
+          { name: "collateralToIntegrator", type: "uint256" },
+          { name: "otToUser", type: "uint256" },
+        ],
+      },
+    ],
+  },
+];
+
+const routerAbi = [
+  {
+    type: "function",
+    name: "swap",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "market", type: "address" },
+      { name: "receiver", type: "address" },
+      { name: "tokenId", type: "uint256" },
+      {
+        name: "params",
+        type: "tuple",
+        components: [
+          { name: "isMint", type: "bool" },
+          { name: "amount", type: "uint256" },
+          { name: "isExactIn", type: "bool" },
+          { name: "minOutOrMaxIn", type: "uint256" },
+        ],
+      },
+      { name: "dataSwap", type: "bytes" },
+      { name: "dataGuess", type: "bytes" },
+      { name: "integrator", type: "address" },
+      { name: "integratorFeeBps", type: "uint256" },
+    ],
+    outputs: [],
+  },
+];
+
+const MARKET_QUERY = `
+query GetMarket($marketAddress: String!) {
+  home_market_list(where: { market_address: { _eq: $marketAddress } }, limit: 1) {
+    title
+    status
+    outcomes
+  }
+}`;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function probeRpc(url) {
+  const started = performance.now();
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
+    signal: AbortSignal.timeout(4000),
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const body = await response.json();
+  if (body.result !== "0x38") throw new Error(`unexpected chain ${body.result || "unknown"}`);
+  return { url, latencyMs: Math.round(performance.now() - started) };
+}
+
+async function rankRpcUrls() {
+  const results = await Promise.all(
+    config.rpcUrls.map(async (url) => {
+      try {
+        return await probeRpc(url);
+      } catch (error) {
+        console.warn(`RPC unavailable: ${url} (${error.message})`);
+        return null;
+      }
+    }),
+  );
+  const available = results.filter(Boolean).sort((left, right) => left.latencyMs - right.latencyMs);
+  if (!available.length) throw new Error("No available BSC RPC endpoint returned chainId 56.");
+  console.log("BSC RPC selected:", available[0].url, `${available[0].latencyMs}ms`);
+  console.log("BSC RPC fallback order:", available.map((entry) => `${entry.url} (${entry.latencyMs}ms)`).join(", "));
+  return available.map((entry) => entry.url);
+}
+
+function createRpcTransport(urls) {
+  return fallback(
+    urls.map((url) => http(url, { retryCount: 0, timeout: 8000 })),
+    { retryCount: 1 },
+  );
+}
+
+function smartSimEps(amount) {
+  if (amount < 5) return 50_000_000_000_000_000n;
+  if (amount <= 1000) return 1_000_000_000_000_000n;
+  return BigInt(Math.floor((1 / amount) * 1e18));
+}
+
+function encodeDataGuess(otDeltaGuessOffchain, maxIterations, eps) {
+  return encodeAbiParameters(
+    [
+      { name: "otDeltaGuessOffchain", type: "uint256" },
+      { name: "maxIterations", type: "uint256" },
+      { name: "eps", type: "uint256" },
+    ],
+    [otDeltaGuessOffchain, maxIterations, eps],
+  );
+}
+
+async function getMarket() {
+  const response = await fetch(config.graphqlUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      query: MARKET_QUERY,
+      variables: { marketAddress: config.marketAddress },
+    }),
+  });
+  if (!response.ok) throw new Error(`GraphQL HTTP ${response.status}`);
+  const json = await response.json();
+  const market = json?.data?.home_market_list?.[0];
+  if (!market) throw new Error(`Market not found: ${config.marketAddress}`);
+  return market;
+}
+
+function findOutcome(market) {
+  return market.outcomes?.find((outcome) => {
+    if (BigInt(outcome.token_id) !== config.targetTokenId) return false;
+    if (config.targetOutcome.toUpperCase() === "AOE") return true;
+    const matchesName =
+      outcome.name === config.targetOutcome ||
+      outcome.symbol === config.targetOutcome;
+    return matchesName;
+  });
+}
+
+async function waitUntilLive() {
+  const startedAt = Date.now();
+  let loggedDryRunStatus = false;
+  for (;;) {
+    const market = await getMarket();
+    const outcome = findOutcome(market);
+    if (!outcome) {
+      throw new Error(
+        `Target outcome not found or token changed: ${config.targetOutcome} / ${config.targetTokenId}`,
+      );
+    }
+
+    const price = Number(outcome.price_hmr);
+    if (!config.dryRun || !loggedDryRunStatus) {
+      console.log(
+        `[${new Date().toISOString()}] status=${market.status} price=${price}`,
+      );
+      loggedDryRunStatus = true;
+    }
+
+    if (price > config.maxPrice) {
+      throw new Error(`Abort: price ${price} > MAX_PRICE ${config.maxPrice}`);
+    }
+    if (market.status === "live") return { market, outcome };
+    if (config.dryRun && Date.now() - startedAt >= config.dryRunMaxWaitMs) {
+      console.log(`DRY RUN: market is still ${market.status} after ${config.dryRunMaxWaitMs}ms; stopping test.`);
+      return { market, outcome, timedOut: true };
+    }
+
+    await sleep(config.pollMs);
+  }
+}
+
+async function recordExecutionIfNeeded(payload) {
+  if (config.dryRun) return;
+  const { recordExecution } = await import("./aoe-dashboard-store.js");
+  recordExecution(payload);
+}
+
+function getQuote(result) {
+  const quote = result?.quote ?? result?.[2];
+  if (!quote) throw new Error("simulateMint did not return quote");
+  return {
+    collateralFromUser: quote.collateralFromUser ?? quote[0],
+    collateralToTreasury: quote.collateralToTreasury ?? quote[1],
+    collateralToIntegrator: quote.collateralToIntegrator ?? quote[2],
+    otToUser: quote.otToUser ?? quote[3],
+  };
+}
+
+async function main() {
+  const startedAt = Date.now();
+  if (!config.privateKey || /^0x0+$/.test(config.privateKey)) {
+    throw new Error("Set PRIVATE_KEY in .env or environment first.");
+  }
+
+  const account = privateKeyToAccount(config.privateKey);
+  const rpcUrls = await rankRpcUrls();
+  const publicClient = createPublicClient({
+    chain: bsc,
+    transport: createRpcTransport(rpcUrls),
+  });
+  const walletClient = createWalletClient({
+    account,
+    chain: bsc,
+    transport: createRpcTransport(rpcUrls),
+  });
+
+  console.log("Receiver:", account.address);
+  console.log("Watching market:", config.marketAddress);
+  console.log("Target:", config.targetOutcome, "token_id", config.targetTokenId);
+  if (config.dryRun) {
+    console.log("DRY RUN: testing only; no approve or buy transaction will be sent.");
+  }
+
+  const liveState = await waitUntilLive();
+  if (config.dryRun && liveState.timedOut) {
+    return;
+  }
+
+  const amountWei = parseUnits(config.buyAmount, config.collateralDecimals);
+  const balance = await publicClient.readContract({
+    address: config.collateral,
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [account.address],
+  });
+  if (balance < amountWei) {
+    throw new Error(
+      `Insufficient USDT: ${formatUnits(balance, config.collateralDecimals)}`,
+    );
+  }
+
+  const allowance = await publicClient.readContract({
+    address: config.collateral,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [account.address, config.router],
+  });
+
+  if (allowance < amountWei) {
+    if (config.dryRun) {
+      console.log("DRY RUN: allowance is below buy amount; would approve USDT to router.");
+      return;
+    }
+    console.log("Approving USDT to router...");
+    const approveHash = await walletClient.writeContract({
+      address: config.collateral,
+      abi: erc20Abi,
+      functionName: "approve",
+      args: [config.router, amountWei],
+    });
+    console.log("Approve tx:", approveHash);
+    await publicClient.waitForTransactionReceipt({ hash: approveHash });
+  }
+
+  const simGuess = encodeDataGuess(0n, 100n, smartSimEps(Number(config.buyAmount)));
+  const { result } = await publicClient.simulateContract({
+    account,
+    address: config.lens,
+    abi: lensAbi,
+    functionName: "simulateMint",
+    args: [
+      config.marketAddress,
+      config.targetTokenId,
+      amountWei,
+      true,
+      "0x",
+      simGuess,
+      config.integratorFeeBps,
+    ],
+  });
+
+  const quote = getQuote(result);
+  const minOut =
+    (quote.otToUser * (10_000n - config.slippageBps)) / 10_000n;
+  console.log("Simulated OT out:", formatUnits(quote.otToUser, config.otDecimals));
+  console.log("Min OT out:", formatUnits(minOut, config.otDecimals));
+
+  const { request } = await publicClient.simulateContract({
+    account,
+    address: config.router,
+    abi: routerAbi,
+    functionName: "swap",
+    args: [
+      config.marketAddress,
+      account.address,
+      config.targetTokenId,
+      {
+        isMint: true,
+        amount: amountWei,
+        isExactIn: true,
+        minOutOrMaxIn: minOut,
+      },
+      "0x",
+      simGuess,
+      config.integrator,
+      config.integratorFeeBps,
+    ],
+  });
+
+  if (config.dryRun) {
+    console.log("DRY RUN: swap simulation succeeded; transaction was not sent.");
+    return;
+  }
+
+  const hash = await walletClient.writeContract(request);
+  console.log("Buy tx:", hash);
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  console.log("Confirmed:", receipt.transactionHash);
+
+  const gasWei =
+    receipt.gasUsed && receipt.effectiveGasPrice
+      ? receipt.gasUsed * receipt.effectiveGasPrice
+      : 0n;
+  await recordExecutionIfNeeded({
+    pair: process.env.AOE_PAIR || "BNB/USDT",
+    side: "BUY",
+    amount_usdt: Number(formatUnits(quote.collateralFromUser, config.collateralDecimals)),
+    price: Number(formatUnits(quote.collateralFromUser, config.collateralDecimals)) /
+      Math.max(Number(formatUnits(quote.otToUser, config.otDecimals)), 1e-12),
+    gas_usdt: Number(formatUnits(gasWei, 18)) * Number(process.env.BNB_USDT_PRICE || "680"),
+    status: receipt.status === "success" ? "success" : "failed",
+    tx_hash: receipt.transactionHash,
+    duration_ms: Date.now() - startedAt,
+    source: "aoe-onchain-buy",
+  });
+}
+
+main().catch(async (error) => {
+  console.error(error);
+  if (config.dryRun) {
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    await recordExecutionIfNeeded({
+      pair: process.env.AOE_PAIR || "BNB/USDT",
+      side: "BUY",
+      amount_usdt: Number(config.buyAmount || 0),
+      status: "failed",
+      duration_ms: 0,
+      source: "aoe-onchain-buy",
+      error: error.message,
+    });
+  } catch (recordError) {
+    console.error("Failed to record execution:", recordError);
+  }
+  process.exitCode = 1;
+});
