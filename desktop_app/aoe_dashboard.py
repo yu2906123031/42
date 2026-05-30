@@ -1715,6 +1715,7 @@ class MainWindow(QMainWindow):
         self.auto_buy_queue = []
         self.auto_current_target = None
         self.auto_current_is_test = False
+        self.auto_current_tx_hash = None
         self.auto_pair_amounts = {"BTC/USDT": "2", "SOL/USDT": "2", "ETH/USDT": "2"}
         self.volume_history_logged = False
         self.last_predictor_mode = None
@@ -2445,6 +2446,7 @@ class MainWindow(QMainWindow):
         process.finished.connect(self.auto_buy_finished)
         self.auto_process = process
         self.auto_current_is_test = dry_run
+        self.auto_current_tx_hash = None
         action = "测试买入（不发送交易）" if dry_run else "链上买入"
         self.log.add(
             "TRADE",
@@ -2461,8 +2463,50 @@ class MainWindow(QMainWindow):
             return
         output = bytes(self.auto_process.readAllStandardOutput()).decode("utf-8", errors="replace")
         for line in output.splitlines():
-            if line.strip():
-                self.log.add("TRADE", line.strip())
+            line = line.strip()
+            if line:
+                tx_match = re.search(r"0x[a-fA-F0-9]{64}", line)
+                if tx_match:
+                    self.auto_current_tx_hash = tx_match.group(0)
+                self.log.add("TRADE", line)
+
+    def send_weixin_buy_success_notification(self, target, tx_hash=None):
+        if str(self.env.get("WEIXIN_BUY_NOTIFY", "1")).strip().lower() in {"0", "false", "no", "off"}:
+            return
+        pair = target.get("pair", "BNB/USDT")
+        message = (
+            "✅ 42 自动买入成功\n"
+            f"交易对：{pair}\n"
+            f"金额：{target.get('amount', '-')} USDT\n"
+            f"区间：{target.get('range', '-')}\n"
+            f"Token ID：{target.get('token_id', '-')}"
+        )
+        if tx_hash:
+            message += f"\nTX：{tx_hash}"
+        hermes_dir = Path(self.env.get("HERMES_AGENT_DIR") or "/root/.hermes/hermes-agent")
+        if not hermes_dir.exists():
+            raise RuntimeError(f"Hermes Agent 目录不存在：{hermes_dir}")
+        if str(hermes_dir) not in sys.path:
+            sys.path.insert(0, str(hermes_dir))
+        for env_file in (Path.home() / ".hermes" / ".env", ROOT_DIR / ".env"):
+            if env_file.exists():
+                for key, value in load_env(env_file).items():
+                    os.environ.setdefault(key, value)
+        from tools.send_message_tool import send_message_tool
+        response = send_message_tool({"action": "send", "target": self.env.get("WEIXIN_NOTIFY_TARGET", "weixin"), "message": message})
+        try:
+            payload = json.loads(response)
+        except Exception:
+            payload = {"raw": response}
+        if isinstance(payload, dict) and payload.get("error"):
+            raise RuntimeError(str(payload.get("error")))
+
+    def send_weixin_buy_success_notification_finished(self, future):
+        try:
+            future.result()
+            self.log.add("SUCCESS", "买入成功通知已发送到微信")
+        except Exception as exc:
+            self.log.add("WARN", f"微信买入成功通知发送失败：{exc}")
 
     def read_auto_buy_error(self):
         if not self.auto_process:
@@ -2483,9 +2527,15 @@ class MainWindow(QMainWindow):
             self.auto_process = None
             self.auto_current_target = None
             self.auto_current_is_test = False
+            self.auto_current_tx_hash = None
             return
         if succeeded:
             self.log.add("SUCCESS", f"自动买入完成：{target['amount']} USDT / {target.get('pair', 'BNB/USDT')} / {target['range']}")
+            self.network_executor.submit(
+                self.send_weixin_buy_success_notification,
+                dict(target),
+                self.auto_current_tx_hash,
+            ).add_done_callback(self.send_weixin_buy_success_notification_finished)
         else:
             self.log.add("ERROR", f"自动买入失败：{target['amount']} USDT / {target.get('pair', 'BNB/USDT')} / {target['range']}，exit={exit_code}")
         self.trade_model.reload()
@@ -2515,6 +2565,7 @@ class MainWindow(QMainWindow):
         self.auto_market_for_run = None
         self.auto_current_target = None
         self.auto_current_is_test = False
+        self.auto_current_tx_hash = None
 
     def runtime_state(self):
         metric, execution = self.store.latest_execution_metrics()

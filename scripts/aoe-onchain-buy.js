@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 import {
   createPublicClient,
   createWalletClient,
@@ -28,6 +29,9 @@ function loadDotEnv(path = ".env") {
 loadDotEnv();
 
 const OFFICIAL_BSC_RPC_URLS = [
+  "https://bsc-rpc.publicnode.com",
+  "https://bsc.meowrpc.com",
+  "https://bsc-mainnet.public.blastapi.io",
   "https://bsc-dataseed.bnbchain.org",
   "https://bsc-dataseed-public.bnbchain.org",
   "https://bsc-dataseed.nariox.org",
@@ -55,8 +59,10 @@ const config = {
   dryRun: process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true",
   dryRunMaxWaitMs: Number(process.env.DRY_RUN_MAX_WAIT_MS || "10000"),
   pollMs: Number(process.env.POLL_MS || "500"),
+  preApprovalMs: Number(process.env.PRE_APPROVAL_MS || "10000"),
   maxPrice: Number(process.env.MAX_PRICE || "0.0015"),
   slippageBps: BigInt(process.env.SLIPPAGE_BPS || "200"),
+  gasPriceMultiplierBps: BigInt(process.env.GAS_PRICE_MULTIPLIER_BPS || "15000"),
   collateral: "0x55d398326f99059ff775485246999027b3197955",
   router: "0x888888886619275d33c00D3BC62DF94D700DCD42",
   lens: "0x8aF85927Cb4deBE57C47DDE5cdb4665839f55a32",
@@ -182,6 +188,8 @@ query GetMarket($marketAddress: String!) {
   home_market_list(where: { market_address: { _eq: $marketAddress } }, limit: 1) {
     title
     status
+    start_timestamp
+    start_timestamp_tz
     outcomes
   }
 }`;
@@ -273,7 +281,7 @@ function findOutcome(market) {
   });
 }
 
-async function waitUntilLive() {
+async function waitUntilLive({ allowPreApproval = false } = {}) {
   const startedAt = Date.now();
   let loggedDryRunStatus = false;
   for (;;) {
@@ -297,6 +305,7 @@ async function waitUntilLive() {
       throw new Error(`Abort: price ${price} > MAX_PRICE ${config.maxPrice}`);
     }
     if (market.status === "live") return { market, outcome };
+    if (allowPreApproval && shouldPrefetchApproval(market)) return { market, outcome, preApprovalWindow: true };
     if (config.dryRun && Date.now() - startedAt >= config.dryRunMaxWaitMs) {
       console.log(`DRY RUN: market is still ${market.status} after ${config.dryRunMaxWaitMs}ms; stopping test.`);
       return { market, outcome, timedOut: true };
@@ -304,6 +313,52 @@ async function waitUntilLive() {
 
     await sleep(config.pollMs);
   }
+}
+
+export function shouldPrefetchApproval(market, nowMs = Date.now(), preApprovalMs = config.preApprovalMs) {
+  if (!market || market.status === "live") return true;
+  const startTimestamp = Number(market.start_timestamp || 0);
+  if (!Number.isFinite(startTimestamp) || startTimestamp <= 0) return false;
+  const startsAtMs = startTimestamp * 1000;
+  return startsAtMs - nowMs <= preApprovalMs;
+}
+
+async function approveIfNeeded(publicClient, walletClient, account, amountWei) {
+  const allowance = await publicClient.readContract({
+    address: config.collateral,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [account.address, config.router],
+  });
+
+  if (allowance >= amountWei) return true;
+  if (config.dryRun) {
+    console.log("DRY RUN: allowance is below buy amount; would approve USDT to router.");
+    return false;
+  }
+  console.log("Approving USDT to router...");
+  const approveHash = await walletClient.writeContract(
+    await applyGasPriceOverride(publicClient, {
+      address: config.collateral,
+      abi: erc20Abi,
+      functionName: "approve",
+      args: [config.router, amountWei],
+    }),
+  );
+  console.log("Approve tx:", approveHash);
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+  return true;
+}
+
+export async function applyGasPriceOverride(publicClient, request, multiplierBps = config.gasPriceMultiplierBps) {
+  if (multiplierBps <= 10_000n) return request;
+  const gasPrice = await publicClient.getGasPrice();
+  const boostedGasPrice = (gasPrice * multiplierBps) / 10_000n;
+  console.log(
+    "Gas price override:",
+    `${formatUnits(gasPrice, 9)} -> ${formatUnits(boostedGasPrice, 9)} gwei`,
+  );
+  return { ...request, gasPrice: boostedGasPrice };
 }
 
 async function recordExecutionIfNeeded(payload) {
@@ -348,11 +403,6 @@ async function main() {
     console.log("DRY RUN: testing only; no approve or buy transaction will be sent.");
   }
 
-  const liveState = await waitUntilLive();
-  if (config.dryRun && liveState.timedOut) {
-    return;
-  }
-
   const amountWei = parseUnits(config.buyAmount, config.collateralDecimals);
   const balance = await publicClient.readContract({
     address: config.collateral,
@@ -366,27 +416,26 @@ async function main() {
     );
   }
 
-  const allowance = await publicClient.readContract({
-    address: config.collateral,
-    abi: erc20Abi,
-    functionName: "allowance",
-    args: [account.address, config.router],
-  });
-
-  if (allowance < amountWei) {
-    if (config.dryRun) {
-      console.log("DRY RUN: allowance is below buy amount; would approve USDT to router.");
+  let liveState;
+  for (;;) {
+    liveState = await waitUntilLive({ allowPreApproval: true });
+    if (config.dryRun && liveState.timedOut) {
       return;
     }
-    console.log("Approving USDT to router...");
-    const approveHash = await walletClient.writeContract({
-      address: config.collateral,
-      abi: erc20Abi,
-      functionName: "approve",
-      args: [config.router, amountWei],
-    });
-    console.log("Approve tx:", approveHash);
-    await publicClient.waitForTransactionReceipt({ hash: approveHash });
+    if (shouldPrefetchApproval(liveState.market)) {
+      const approved = await approveIfNeeded(publicClient, walletClient, account, amountWei);
+      if (!approved) return;
+      break;
+    }
+    const startsAtMs = Number(liveState.market.start_timestamp || 0) * 1000;
+    const waitMs = Math.max(0, startsAtMs - Date.now() - config.preApprovalMs);
+    console.log(`Waiting ${waitMs}ms before pre-approval window.`);
+    await sleep(Math.min(waitMs, config.pollMs));
+  }
+
+  if (liveState.market.status !== "live") {
+    liveState = await waitUntilLive();
+    if (config.dryRun && liveState.timedOut) return;
   }
 
   const simGuess = encodeDataGuess(0n, 100n, smartSimEps(Number(config.buyAmount)));
@@ -439,7 +488,9 @@ async function main() {
     return;
   }
 
-  const hash = await walletClient.writeContract(request);
+  const hash = await walletClient.writeContract(
+    await applyGasPriceOverride(publicClient, request),
+  );
   console.log("Buy tx:", hash);
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   console.log("Confirmed:", receipt.transactionHash);
@@ -462,24 +513,26 @@ async function main() {
   });
 }
 
-main().catch(async (error) => {
-  console.error(error);
-  if (config.dryRun) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(async (error) => {
+    console.error(error);
+    if (config.dryRun) {
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      await recordExecutionIfNeeded({
+        pair: process.env.AOE_PAIR || "BNB/USDT",
+        side: "BUY",
+        amount_usdt: Number(config.buyAmount || 0),
+        status: "failed",
+        duration_ms: 0,
+        source: "aoe-onchain-buy",
+        error: error.message,
+      });
+    } catch (recordError) {
+      console.error("Failed to record execution:", recordError);
+    }
     process.exitCode = 1;
-    return;
-  }
-  try {
-    await recordExecutionIfNeeded({
-      pair: process.env.AOE_PAIR || "BNB/USDT",
-      side: "BUY",
-      amount_usdt: Number(config.buyAmount || 0),
-      status: "failed",
-      duration_ms: 0,
-      source: "aoe-onchain-buy",
-      error: error.message,
-    });
-  } catch (recordError) {
-    console.error("Failed to record execution:", recordError);
-  }
-  process.exitCode = 1;
-});
+  });
+}
