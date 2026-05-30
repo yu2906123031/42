@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { shouldPrefetchApproval, applyGasPriceOverride } from "./aoe-onchain-buy.js";
+import { shouldPrefetchApproval, applyGasPriceOverride, buildWeixinBuySuccessMessage } from "./aoe-onchain-buy.js";
 
 test("prefetches approval inside configured window before market start", () => {
   const startTimestamp = 1_700_000_010;
@@ -36,4 +36,18 @@ test("gas override leaves request unchanged at 100% multiplier", async () => {
   const publicClient = { getGasPrice: async () => 3_000_000_000n };
 
   assert.equal(await applyGasPriceOverride(publicClient, request, 10_000n), request);
+});
+
+test("builds weixin success notification message", () => {
+  const message = buildWeixinBuySuccessMessage({
+    pair: "BNB/USDT",
+    amount_usdt: 42,
+    token_id: 1,
+    tx_hash: "0xabc",
+    duration_ms: 1234,
+  });
+
+  assert.match(message, /42 自动买入成功/);
+  assert.match(message, /金额：42 USDT/);
+  assert.match(message, /TX：0xabc/);
 });

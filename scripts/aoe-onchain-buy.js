@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import {
   createPublicClient,
@@ -367,6 +368,65 @@ async function recordExecutionIfNeeded(payload) {
   recordExecution(payload);
 }
 
+export function buildWeixinBuySuccessMessage(payload) {
+  const lines = [
+    "✅ 42 自动买入成功",
+    `交易对：${payload.pair || "BNB/USDT"}`,
+    `金额：${payload.amount_usdt ?? "-"} USDT`,
+  ];
+  if (payload.token_id) lines.push(`Token ID：${payload.token_id}`);
+  if (payload.tx_hash) lines.push(`TX：${payload.tx_hash}`);
+  if (payload.duration_ms != null) lines.push(`耗时：${payload.duration_ms}ms`);
+  return lines.join("\n");
+}
+
+async function sendWeixinBuySuccessNotificationIfNeeded(payload) {
+  if (config.dryRun) return;
+  if (String(process.env.WEIXIN_BUY_NOTIFY || "1").trim().toLowerCase().match(/^(0|false|no|off)$/)) return;
+  const hermesDir = process.env.HERMES_AGENT_DIR || "/root/.hermes/hermes-agent";
+  const target = process.env.WEIXIN_NOTIFY_TARGET || "weixin";
+  const message = buildWeixinBuySuccessMessage(payload);
+  const code = String.raw`
+import json, os, sys
+from pathlib import Path
+
+def load_env(path):
+    values = {}
+    if not Path(path).exists():
+        return values
+    for raw in Path(path).read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+payload = json.loads(sys.stdin.read())
+hermes_dir = Path(payload['hermes_dir'])
+if str(hermes_dir) not in sys.path:
+    sys.path.insert(0, str(hermes_dir))
+root_dir = Path(payload['root_dir'])
+for env_file in (Path.home() / '.hermes' / '.env', root_dir / '.env'):
+    for key, value in load_env(env_file).items():
+        os.environ.setdefault(key, value)
+from tools.send_message_tool import send_message_tool
+print(send_message_tool({'action': 'send', 'target': payload['target'], 'message': payload['message']}))
+`;
+  const result = spawnSync("python3", ["-c", code], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    input: JSON.stringify({ hermes_dir: hermesDir, root_dir: process.cwd(), target, message }),
+    timeout: 30_000,
+  });
+  const output = `${result.stdout || ""}${result.stderr || ""}`.trim();
+  if (result.status !== 0 || /"error"\s*:/.test(output)) {
+    console.error("Weixin notify failed:", output || result.error?.message || `exit ${result.status}`);
+    return;
+  }
+  console.log("Weixin notify sent.");
+}
+
 function getQuote(result) {
   const quote = result?.quote ?? result?.[2];
   if (!quote) throw new Error("simulateMint did not return quote");
@@ -499,7 +559,7 @@ async function main() {
     receipt.gasUsed && receipt.effectiveGasPrice
       ? receipt.gasUsed * receipt.effectiveGasPrice
       : 0n;
-  await recordExecutionIfNeeded({
+  const executionPayload = {
     pair: process.env.AOE_PAIR || "BNB/USDT",
     side: "BUY",
     amount_usdt: Number(formatUnits(quote.collateralFromUser, config.collateralDecimals)),
@@ -508,9 +568,14 @@ async function main() {
     gas_usdt: Number(formatUnits(gasWei, 18)) * Number(process.env.BNB_USDT_PRICE || "680"),
     status: receipt.status === "success" ? "success" : "failed",
     tx_hash: receipt.transactionHash,
+    token_id: config.targetTokenId,
     duration_ms: Date.now() - startedAt,
     source: "aoe-onchain-buy",
-  });
+  };
+  await recordExecutionIfNeeded(executionPayload);
+  if (receipt.status === "success") {
+    await sendWeixinBuySuccessNotificationIfNeeded(executionPayload);
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
