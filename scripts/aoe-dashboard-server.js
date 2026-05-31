@@ -6,7 +6,7 @@ const db = getDb();
 rebuildDailyStats(db);
 
 let config = {
-  pairs: ["BNB/USDT", "SOL/USDT", "ETH/USDT"],
+  pairs: ["BNB/USDT", "BTC/USDT", "SOL/USDT", "ETH/USDT"],
   buyAmount: 100,
   gasMultiplier: 1.25,
   maxGas: 0.25,
@@ -14,6 +14,7 @@ let config = {
   dailyMaxBuys: 12,
   dryRun: true,
   running: false,
+  headlessAutoBuy: ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_ENABLED || "0").toLowerCase()),
 };
 
 const logs = [

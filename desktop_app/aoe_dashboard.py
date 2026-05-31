@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 
-APP_NAME = "AOE Dashboard"
+APP_NAME = "42"
 BEIJING_TZ = timezone(timedelta(hours=8))
 if getattr(sys, "frozen", False):
     _exe_dir = Path(sys.executable).resolve().parent
@@ -1732,7 +1732,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(100, self.refresh_market_data)
         QTimer.singleShot(500, self.discover_tomorrow_contract)
         QTimer.singleShot(900, self.refresh_predictor)
-        self.log.add("INFO", "AOE Dashboard 原生交易终端已启动")
+        self.log.add("INFO", "42 原生交易终端已启动")
         self.log.add("SUCCESS", "SQLite runtime-state/trades.db 已连接")
         self.log.add("INFO", "SMART 自动买入：07:59:30 预扫描 BNB/BTC/SOL/ETH 明日合约，08:00 后按各自 UTC Daily Vol 预测区间")
         self.log.add("INFO", "自动买入当前状态：" + ("已启用" if self.automation_enabled else "未启用"))

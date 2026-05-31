@@ -4,10 +4,13 @@ import { pathToFileURL } from "node:url";
 import {
   createPublicClient,
   createWalletClient,
+  decodeErrorResult,
   encodeAbiParameters,
+  encodeFunctionData,
   fallback,
   formatUnits,
   http,
+  keccak256,
   parseUnits,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -62,8 +65,11 @@ const config = {
   pollMs: Number(process.env.POLL_MS || "500"),
   preApprovalMs: Number(process.env.PRE_APPROVAL_MS || "10000"),
   maxPrice: Number(process.env.MAX_PRICE || "0.0015"),
-  slippageBps: BigInt(process.env.SLIPPAGE_BPS || "200"),
+  slippageBps: parseSlippageBps(process.env.SLIPPAGE_BPS),
   gasPriceMultiplierBps: BigInt(process.env.GAS_PRICE_MULTIPLIER_BPS || "15000"),
+  preSignOpeningTx: shouldPreSignOpeningTx(process.env.PRE_SIGN_OPENING_TX),
+  preSignGasLimit: BigInt(process.env.PRE_SIGN_GAS_LIMIT || "650000"),
+  rawTxFanoutLimit: Number(process.env.RAW_TX_FANOUT_LIMIT || "0"),
   collateral: "0x55d398326f99059ff775485246999027b3197955",
   router: "0x888888886619275d33c00D3BC62DF94D700DCD42",
   lens: "0x8aF85927Cb4deBE57C47DDE5cdb4665839f55a32",
@@ -158,6 +164,11 @@ const lensAbi = [
 
 const routerAbi = [
   {
+    type: "error",
+    name: "MarketNotStarted",
+    inputs: [],
+  },
+  {
     type: "function",
     name: "swap",
     stateMutability: "nonpayable",
@@ -183,6 +194,185 @@ const routerAbi = [
     outputs: [],
   },
 ];
+
+export const MAX_UINT256 = (1n << 256n) - 1n;
+
+export function shouldApproveRouter(allowance, amountWei) {
+  return BigInt(allowance) < BigInt(amountWei);
+}
+
+export function approvalAmountForRouter() {
+  return MAX_UINT256;
+}
+
+export function decodeRouterErrorName(data) {
+  const decoded = decodeErrorResult({ abi: routerAbi, data });
+  return decoded.errorName;
+}
+
+export function defaultOpeningSlippageBps() {
+  return 800n;
+}
+
+export function parseSlippageBps(value) {
+  const parsed = BigInt(value || String(defaultOpeningSlippageBps()));
+  if (parsed < 0n || parsed > 10_000n) {
+    throw new Error(`SLIPPAGE_BPS must be between 0 and 10000, got ${parsed}`);
+  }
+  return parsed;
+}
+
+export function shouldPreSignOpeningTx(value) {
+  if (value === undefined || value === null || value === "") return true;
+  return !["0", "false", "no", "off"].includes(String(value).trim().toLowerCase());
+}
+
+export function classifyRawTxBroadcastError(error) {
+  const text = String(error?.shortMessage || error?.details || error?.message || error || "").toLowerCase();
+  if (text.includes("already known") || text.includes("already imported") || text.includes("known transaction")) return "already_known";
+  if (text.includes("nonce too low")) return "nonce_too_low";
+  if (text.includes("replacement") && text.includes("underpriced")) return "replacement_underpriced";
+  if (text.includes("insufficient funds")) return "insufficient_funds";
+  if (text.includes("revert")) return "reverted";
+  if (text.includes("timeout") || text.includes("timed out") || text.includes("etimedout")) return "timeout";
+  return "unknown";
+}
+
+function buildRawTxBroadcastDiagnostics(settled, clients) {
+  return settled.map((result, index) => {
+    if (result.status === "fulfilled") {
+      return { rpc: clients[index]?.name ?? `rpc-${index}`, status: "success", hash: result.value };
+    }
+    return {
+      rpc: clients[index]?.name ?? `rpc-${index}`,
+      status: "failed",
+      category: classifyRawTxBroadcastError(result.reason),
+      message: result.reason?.shortMessage || result.reason?.message || String(result.reason),
+    };
+  });
+}
+
+async function broadcastSignedTransactionOnce({ signedTransaction, sendRawTransaction, sendRawTransactionClients }) {
+  if (sendRawTransactionClients?.length) {
+    const settled = await Promise.allSettled(
+      sendRawTransactionClients.map((client) =>
+        client.sendRawTransaction({ serializedTransaction: signedTransaction }),
+      ),
+    );
+    const success = settled.find((result) => result.status === "fulfilled");
+    if (success) return success.value;
+    const diagnostics = buildRawTxBroadcastDiagnostics(settled, sendRawTransactionClients);
+    if (diagnostics.some((entry) => entry.category === "already_known")) {
+      return keccak256(signedTransaction);
+    }
+    const error = settled[0]?.reason ?? new Error("all raw transaction broadcasts failed");
+    error.broadcastDiagnostics = diagnostics;
+    throw error;
+  }
+  return sendRawTransaction({ serializedTransaction: signedTransaction });
+}
+
+export async function sendSignedTransactionWithRetry({
+  signedTransaction,
+  sendRawTransaction,
+  sendRawTransactionClients,
+  maxRetries = 1,
+  logFn = console.warn,
+}) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await broadcastSignedTransactionOnce({
+        signedTransaction,
+        sendRawTransaction,
+        sendRawTransactionClients,
+      });
+    } catch (error) {
+      if (attempt >= maxRetries) throw error;
+      attempt += 1;
+      logFn(`sendRawTransaction failed; retrying once attempt=${attempt} error=${error.message}`);
+    }
+  }
+}
+
+export function describeTransactionReceiptStatus(receipt, error, fallbackHash) {
+  if (receipt) {
+    return {
+      confirmation_status: receipt.status === "success" ? "confirmed" : "reverted",
+      transaction_hash: receipt.transactionHash,
+      block_number: stringifyBigInt(receipt.blockNumber),
+    };
+  }
+  return {
+    confirmation_status: classifyRawTxBroadcastError(error) === "timeout" ? "timeout" : "failed",
+    transaction_hash: fallbackHash,
+    error: error?.shortMessage || error?.message || String(error),
+  };
+}
+
+export function minOutFromQuote(otToUser, slippageBps) {
+  return (BigInt(otToUser) * (10_000n - BigInt(slippageBps))) / 10_000n;
+}
+
+function stringifyBigInt(value) {
+  if (value === undefined || value === null) return undefined;
+  return BigInt(value).toString();
+}
+
+function extractErrorData(error) {
+  return error?.data?.data || error?.data || error?.cause?.data?.data || error?.cause?.data;
+}
+
+export function buildSwapFailureDiagnostics({
+  error,
+  initialQuote,
+  retryQuote,
+  minOut,
+  retryMinOut,
+  gasPrice,
+  blockNumber,
+  marketStatus,
+  deadline,
+}) {
+  const errorData = extractErrorData(error);
+  let routerError;
+  if (typeof errorData === "string" && errorData.startsWith("0x")) {
+    try {
+      routerError = decodeRouterErrorName(errorData);
+    } catch {
+      routerError = undefined;
+    }
+  }
+  return Object.fromEntries(
+    Object.entries({
+      router_error: routerError,
+      router_error_data: typeof errorData === "string" ? errorData : undefined,
+      initial_quote_out: stringifyBigInt(initialQuote?.otToUser),
+      retry_quote_out: stringifyBigInt(retryQuote?.otToUser),
+      initial_pool_price_pre: stringifyBigInt(initialQuote?.prePrice),
+      initial_pool_price_post: stringifyBigInt(initialQuote?.postPrice),
+      retry_pool_price_pre: stringifyBigInt(retryQuote?.prePrice),
+      retry_pool_price_post: stringifyBigInt(retryQuote?.postPrice),
+      min_out: stringifyBigInt(minOut),
+      retry_min_out: stringifyBigInt(retryMinOut),
+      deadline,
+      gas_price: stringifyBigInt(gasPrice),
+      block_number: stringifyBigInt(blockNumber),
+      market_status: marketStatus,
+    }).filter(([, value]) => value !== undefined),
+  );
+}
+
+export function chooseSwapQuoteAfterSimulationFailure({ originalMinOut, retryQuote, slippageBps }) {
+  if (BigInt(retryQuote.otToUser) < BigInt(originalMinOut)) {
+    return { shouldRetrySwap: false, reason: "retry_quote_below_original_min_out" };
+  }
+  return {
+    shouldRetrySwap: true,
+    quote: retryQuote,
+    minOut: minOutFromQuote(retryQuote.otToUser, slippageBps),
+  };
+}
 
 const MARKET_QUERY = `
 query GetMarket($marketAddress: String!) {
@@ -236,6 +426,20 @@ function createRpcTransport(urls) {
     urls.map((url) => http(url, { retryCount: 0, timeout: 8000 })),
     { retryCount: 1 },
   );
+}
+
+function createRawTxBroadcastClients(urls) {
+  const selectedUrls = config.rawTxFanoutLimit > 0 ? urls.slice(0, config.rawTxFanoutLimit) : urls;
+  return selectedUrls.map((url) => {
+    const client = createPublicClient({
+      chain: bsc,
+      transport: http(url, { retryCount: 0, timeout: 8000 }),
+    });
+    return {
+      name: url,
+      sendRawTransaction: client.sendRawTransaction.bind(client),
+    };
+  });
 }
 
 function smartSimEps(amount) {
@@ -332,18 +536,18 @@ async function approveIfNeeded(publicClient, walletClient, account, amountWei) {
     args: [account.address, config.router],
   });
 
-  if (allowance >= amountWei) return true;
+  if (!shouldApproveRouter(allowance, amountWei)) return true;
   if (config.dryRun) {
     console.log("DRY RUN: allowance is below buy amount; would approve USDT to router.");
     return false;
   }
-  console.log("Approving USDT to router...");
+  console.log("Approving unlimited USDT to router...");
   const approveHash = await walletClient.writeContract(
     await applyGasPriceOverride(publicClient, {
       address: config.collateral,
       abi: erc20Abi,
       functionName: "approve",
-      args: [config.router, amountWei],
+      args: [config.router, approvalAmountForRouter()],
     }),
   );
   console.log("Approve tx:", approveHash);
@@ -428,14 +632,138 @@ print(send_message_tool({'action': 'send', 'target': payload['target'], 'message
 }
 
 function getQuote(result) {
+  const pre = result?.pre ?? result?.[0];
+  const post = result?.post ?? result?.[1];
   const quote = result?.quote ?? result?.[2];
   if (!quote) throw new Error("simulateMint did not return quote");
   return {
+    prePrice: pre?.price ?? pre?.[1],
+    postPrice: post?.price ?? post?.[1],
     collateralFromUser: quote.collateralFromUser ?? quote[0],
     collateralToTreasury: quote.collateralToTreasury ?? quote[1],
     collateralToIntegrator: quote.collateralToIntegrator ?? quote[2],
     otToUser: quote.otToUser ?? quote[3],
   };
+}
+
+async function simulateMintQuote(publicClient, amountWei, simGuess) {
+  const { result } = await publicClient.simulateContract({
+    address: config.lens,
+    abi: lensAbi,
+    functionName: "simulateMint",
+    args: [
+      config.marketAddress,
+      config.targetTokenId,
+      amountWei,
+      true,
+      "0x",
+      simGuess,
+      config.integratorFeeBps,
+    ],
+  });
+  return getQuote(result);
+}
+
+async function simulateSwapRequest(publicClient, account, amountWei, minOut, simGuess) {
+  const { request } = await publicClient.simulateContract({
+    account,
+    address: config.router,
+    abi: routerAbi,
+    functionName: "swap",
+    args: swapArgs(account, amountWei, minOut, simGuess),
+  });
+  return request;
+}
+
+function swapArgs(account, amountWei, minOut, simGuess) {
+  return [
+    config.marketAddress,
+    account.address,
+    config.targetTokenId,
+    {
+      isMint: true,
+      amount: amountWei,
+      isExactIn: true,
+      minOutOrMaxIn: minOut,
+    },
+    "0x",
+    simGuess,
+    config.integrator,
+    config.integratorFeeBps,
+  ];
+}
+
+async function prepareSignedSwapTransaction({ publicClient, account, amountWei, minOut, simGuess, gasPrice }) {
+  const [nonce, blockGasPrice] = await Promise.all([
+    publicClient.getTransactionCount({ address: account.address, blockTag: "pending" }),
+    gasPrice == null ? publicClient.getGasPrice() : Promise.resolve(gasPrice),
+  ]);
+  const data = encodeFunctionData({
+    abi: routerAbi,
+    functionName: "swap",
+    args: swapArgs(account, amountWei, minOut, simGuess),
+  });
+  const signedTransaction = await account.signTransaction({
+    chainId: bsc.id,
+    to: config.router,
+    data,
+    value: 0n,
+    gas: config.preSignGasLimit,
+    gasPrice: blockGasPrice,
+    nonce,
+  });
+  return { signedTransaction, nonce, gasPrice: blockGasPrice, gas: config.preSignGasLimit };
+}
+
+async function recordSwapFailure({ error, initialQuote, retryQuote, minOut, retryMinOut, gasPrice, blockNumber, marketStatus, startedAt }) {
+  const diagnostics = buildSwapFailureDiagnostics({
+    error,
+    initialQuote,
+    retryQuote,
+    minOut,
+    retryMinOut,
+    gasPrice,
+    blockNumber,
+    marketStatus,
+    deadline: "none",
+  });
+  console.error("Swap simulation diagnostics:", JSON.stringify(diagnostics));
+  await recordExecutionIfNeeded({
+    pair: process.env.AOE_PAIR || "BNB/USDT",
+    side: "BUY",
+    amount_usdt: Number(config.buyAmount || 0),
+    status: "failed",
+    duration_ms: Date.now() - startedAt,
+    source: "aoe-onchain-buy",
+    error: JSON.stringify({ message: error.message, diagnostics }),
+  });
+  return diagnostics;
+}
+
+async function ensureRouterAllowance({ publicClient, walletClient, account, amountWei }) {
+  const allowance = await publicClient.readContract({
+    address: config.collateral,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [account.address, config.router],
+  });
+
+  if (!shouldApproveRouter(allowance, amountWei)) {
+    return;
+  }
+  if (config.dryRun) {
+    console.log("DRY RUN: allowance is below buy amount; would approve unlimited USDT to router.");
+    return;
+  }
+  console.log("Approving unlimited USDT to router...");
+  const approveHash = await walletClient.writeContract({
+    address: config.collateral,
+    abi: erc20Abi,
+    functionName: "approve",
+    args: [config.router, approvalAmountForRouter(amountWei)],
+  });
+  console.log("Approve tx:", approveHash);
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
 }
 
 async function main() {
@@ -450,6 +778,7 @@ async function main() {
     chain: bsc,
     transport: createRpcTransport(rpcUrls),
   });
+  const rawTxBroadcastClients = createRawTxBroadcastClients(rpcUrls);
   const walletClient = createWalletClient({
     account,
     chain: bsc,
@@ -459,6 +788,9 @@ async function main() {
   console.log("Receiver:", account.address);
   console.log("Watching market:", config.marketAddress);
   console.log("Target:", config.targetOutcome, "token_id", config.targetTokenId);
+  if (config.preSignOpeningTx && !config.dryRun) {
+    console.log("Raw tx broadcast fanout:", rawTxBroadcastClients.map((client) => client.name).join(", "));
+  }
   if (config.dryRun) {
     console.log("DRY RUN: testing only; no approve or buy transaction will be sent.");
   }
@@ -499,60 +831,91 @@ async function main() {
   }
 
   const simGuess = encodeDataGuess(0n, 100n, smartSimEps(Number(config.buyAmount)));
-  const { result } = await publicClient.simulateContract({
-    account,
-    address: config.lens,
-    abi: lensAbi,
-    functionName: "simulateMint",
-    args: [
-      config.marketAddress,
-      config.targetTokenId,
-      amountWei,
-      true,
-      "0x",
-      simGuess,
-      config.integratorFeeBps,
-    ],
-  });
-
-  const quote = getQuote(result);
-  const minOut =
-    (quote.otToUser * (10_000n - config.slippageBps)) / 10_000n;
+  const quote = await simulateMintQuote(publicClient, amountWei, simGuess);
+  let minOut = minOutFromQuote(quote.otToUser, config.slippageBps);
   console.log("Simulated OT out:", formatUnits(quote.otToUser, config.otDecimals));
   console.log("Min OT out:", formatUnits(minOut, config.otDecimals));
 
-  const { request } = await publicClient.simulateContract({
-    account,
-    address: config.router,
-    abi: routerAbi,
-    functionName: "swap",
-    args: [
-      config.marketAddress,
-      account.address,
-      config.targetTokenId,
-      {
-        isMint: true,
-        amount: amountWei,
-        isExactIn: true,
-        minOutOrMaxIn: minOut,
-      },
-      "0x",
-      simGuess,
-      config.integrator,
-      config.integratorFeeBps,
-    ],
-  });
+  const [gasPrice, blockNumber] = await Promise.all([
+    publicClient.getGasPrice(),
+    publicClient.getBlockNumber(),
+  ]);
+
+  let request;
+  let signedSwap;
+  if (config.preSignOpeningTx && !config.dryRun) {
+    signedSwap = await prepareSignedSwapTransaction({ publicClient, account, amountWei, minOut, simGuess, gasPrice });
+    console.log(`Pre-signed buy tx nonce=${signedSwap.nonce} gas=${signedSwap.gas} gasPrice=${signedSwap.gasPrice}`);
+  } else {
+    try {
+      request = await simulateSwapRequest(publicClient, account, amountWei, minOut, simGuess);
+    } catch (error) {
+      console.error("Swap simulation failed; re-quoting once before deciding whether to pursue.");
+      const retryQuote = await simulateMintQuote(publicClient, amountWei, simGuess);
+      const retryDecision = chooseSwapQuoteAfterSimulationFailure({
+        originalMinOut: minOut,
+        retryQuote,
+        slippageBps: config.slippageBps,
+      });
+      const retryMinOut = retryDecision.minOut ?? minOutFromQuote(retryQuote.otToUser, config.slippageBps);
+      console.log("Retry simulated OT out:", formatUnits(retryQuote.otToUser, config.otDecimals));
+      console.log("Retry Min OT out:", formatUnits(retryMinOut, config.otDecimals));
+      await recordSwapFailure({
+        error,
+        initialQuote: quote,
+        retryQuote,
+        minOut,
+        retryMinOut,
+        gasPrice,
+        blockNumber,
+        marketStatus: "pre-live-simulation",
+        startedAt,
+      });
+      if (!retryDecision.shouldRetrySwap) {
+        throw new Error(`Swap simulation failed and retry quote stopped: ${retryDecision.reason}`);
+      }
+      minOut = retryDecision.minOut;
+      request = await simulateSwapRequest(publicClient, account, amountWei, minOut, simGuess);
+    }
+  }
+
+  liveState = await waitUntilLive();
+  if (config.dryRun && liveState.timedOut) {
+    return;
+  }
 
   if (config.dryRun) {
     console.log("DRY RUN: swap simulation succeeded; transaction was not sent.");
     return;
   }
 
-  const hash = await walletClient.writeContract(
-    await applyGasPriceOverride(publicClient, request),
-  );
+  const hash = signedSwap
+    ? await sendSignedTransactionWithRetry({
+        signedTransaction: signedSwap.signedTransaction,
+        sendRawTransactionClients: rawTxBroadcastClients,
+      })
+    : await walletClient.writeContract(await applyGasPriceOverride(publicClient, request));
   console.log("Buy tx:", hash);
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  let receipt;
+  try {
+    receipt = await publicClient.waitForTransactionReceipt({ hash });
+  } catch (error) {
+    const confirmation = describeTransactionReceiptStatus(null, error, hash);
+    console.error("Confirmation diagnostics:", JSON.stringify(confirmation));
+    await recordExecutionIfNeeded({
+      pair: process.env.AOE_PAIR || "BNB/USDT",
+      side: "BUY",
+      amount_usdt: Number(config.buyAmount || 0),
+      status: "pending",
+      tx_hash: hash,
+      duration_ms: Date.now() - startedAt,
+      source: "aoe-onchain-buy",
+      error: JSON.stringify(confirmation),
+    });
+    throw error;
+  }
+  const confirmation = describeTransactionReceiptStatus(receipt);
+  console.log("Confirmation diagnostics:", JSON.stringify(confirmation));
   console.log("Confirmed:", receipt.transactionHash);
 
   const gasWei =
