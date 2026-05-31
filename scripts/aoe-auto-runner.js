@@ -175,15 +175,17 @@ function log(message, logFn = console.log) {
   logFn(`[${new Date().toISOString()}] ${message}`);
 }
 
-function runBuy(pair, market, { nonce, batchApproval } = {}) {
+export function runBuy(pair, market, { nonce, batchApproval, amounts = AMOUNTS, maxPrices = {}, spawnFn = spawn, logFn = console.log } = {}) {
+  const buyAmount = amounts[pair] || amounts["BNB/USDT"] || "5";
+  const maxPrice = maxPrices[pair] || process.env.AUTO_MAX_OUTCOME_PRICE || process.env.AUTO_BUY_MAX_PRICE || process.env.MAX_PRICE || "0.45";
   const env = {
     ...process.env,
     AOE_PAIR: pair,
     MARKET_ADDRESS: market.market_address,
     EVENT_DAY: market.event_day,
-    BUY_AMOUNT_USDT: AMOUNTS[pair] || AMOUNTS["BNB/USDT"] || "5",
+    BUY_AMOUNT_USDT: String(buyAmount),
     DRY_RUN: DRY_RUN ? "true" : "false",
-    MAX_PRICE: process.env.AUTO_MAX_OUTCOME_PRICE || process.env.AUTO_BUY_MAX_PRICE || process.env.MAX_PRICE || "0.45",
+    MAX_PRICE: String(maxPrice),
     OPENING_EXECUTION_MODE: process.env.OPENING_EXECUTION_MODE || "HYBRID",
     ...(nonce == null ? {} : { BUY_NONCE: String(nonce) }),
     ...(batchApproval?.approved ? {
@@ -194,11 +196,11 @@ function runBuy(pair, market, { nonce, batchApproval } = {}) {
       BATCH_APPROVAL_TX: batchApproval.hash || "already-approved",
     } : {}),
   };
-  console.log(`[${new Date().toISOString()}] buy start pair=${pair} market=${market.market_address} nonce=${env.BUY_NONCE ?? "auto"} amount=${env.BUY_AMOUNT_USDT} dryRun=${env.DRY_RUN}`);
+  logFn(`[${new Date().toISOString()}] buy start pair=${pair} market=${market.market_address} nonce=${env.BUY_NONCE ?? "auto"} amount=${env.BUY_AMOUNT_USDT} maxPrice=${env.MAX_PRICE} dryRun=${env.DRY_RUN}`);
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, ["scripts/aoe-onchain-buy.js"], { env, stdio: "inherit" });
+    const child = spawnFn(process.execPath, ["scripts/aoe-onchain-buy.js"], { env, stdio: "inherit" });
     child.on("exit", (code, signal) => {
-      console.log(`[${new Date().toISOString()}] buy finished pair=${pair} code=${code} signal=${signal || ""}`);
+      logFn(`[${new Date().toISOString()}] buy finished pair=${pair} code=${code} signal=${signal || ""}`);
       resolve(code || 0);
     });
   });
@@ -206,6 +208,8 @@ function runBuy(pair, market, { nonce, batchApproval } = {}) {
 
 export async function runBuysConcurrently({
   pairs = PAIRS,
+  amounts = AMOUNTS,
+  maxPrices = {},
   eventDate = eventDateForScan(),
   discoverMarketFn = discoverMarket,
   runBuyFn = runBuy,
@@ -218,7 +222,7 @@ export async function runBuysConcurrently({
     const publicClient = createPublicClient({ chain: bsc, transport: fallback(urls.map((url) => http(url, { retryCount: 0, timeout: 8000 }))) });
     const account = privateKeyToAccount(process.env.PRIVATE_KEY);
     const walletClient = createWalletClient({ account, chain: bsc, transport: fallback(urls.map((url) => http(url, { retryCount: 0, timeout: 8000 }))) });
-    const approval = await preflightAllowanceForBatch({ publicClient, walletClient, account, pairs, amounts: AMOUNTS, dryRun: DRY_RUN, logFn });
+    const approval = await preflightAllowanceForBatch({ publicClient, walletClient, account, pairs, amounts, dryRun: DRY_RUN, logFn });
     if (!approval.approved) return pairs.map((pair) => ({ pair, status: "skipped", reason: "batch_approval_failed" }));
     batchApproval = {
       approved: true,
@@ -247,7 +251,7 @@ export async function runBuysConcurrently({
       }
       const nonce = nonceManager?.allocate();
       updateAutoBuyLock(lock.lockId, { status: "running", nonce });
-      const code = await runBuyFn(pair, market, { nonce, batchApproval });
+      const code = await runBuyFn(pair, market, { nonce, batchApproval, amounts, maxPrices });
       const status = buyStatusFromCode(code);
       updateAutoBuyLock(lock.lockId, { status, nonce, error: status === "failed" ? `child_exit_${code}` : null });
       return { pair, status, code, market: market.market_address, nonce };
@@ -271,12 +275,19 @@ export async function runCycle({
   const generated = await generatePlansFn({ env: { ...process.env, EVENT_DAY: process.env.EVENT_DAY || eventDay }, logFn });
   const plannedPairs = new Set((generated?.plans || []).map((plan) => plan.pair));
   const pairs = PAIRS.filter((pair) => plannedPairs.has(pair));
+  const amounts = { ...AMOUNTS };
+  const maxPrices = {};
+  for (const plan of generated?.plans || []) {
+    if (!plan?.pair) continue;
+    if (plan.buy_amount_usdt != null) amounts[plan.pair] = String(plan.buy_amount_usdt);
+    if (plan.max_price != null) maxPrices[plan.pair] = String(plan.max_price);
+  }
   if (!pairs.length) {
     logFn(`[${new Date().toISOString()}] no opening plans generated; skipping buy cycle`);
     return [];
   }
   logFn(`[${new Date().toISOString()}] discovering markets for UTC ${eventDay} plannedPairs=${pairs.join(",")}`);
-  const results = await runBuysConcurrentlyFn({ eventDate, pairs, logFn });
+  const results = await runBuysConcurrentlyFn({ eventDate, pairs, amounts, maxPrices, logFn });
   const summary = summarizeBuyResults(results);
   logFn(`[${new Date().toISOString()}] buy cycle summary total=${summary.total} success=${summary.success} failed=${summary.failed} skipped=${summary.skipped}`);
   return results;

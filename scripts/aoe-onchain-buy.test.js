@@ -376,6 +376,35 @@ test("runner invokes opening plan generator before buys", async () => {
   assert.deepEqual(calls, ["generate", "buy"]);
 });
 
+test("runner uses generated plan amounts and max prices for buy orchestration", async () => {
+  let received;
+  await runner.runCycle({
+    eventDate: new Date("2026-06-01T00:00:00Z"),
+    generatePlansFn: async () => ({ plans: [{ pair: "BNB/USDT", buy_amount_usdt: "11", max_price: 0.22 }] }),
+    runBuysConcurrentlyFn: async (args) => { received = args; return []; },
+    logFn: () => {},
+  });
+  assert.equal(received.amounts["BNB/USDT"], "11");
+  assert.equal(received.maxPrices["BNB/USDT"], "0.22");
+});
+
+test("runBuy passes per-plan amount and max price to onchain child", async () => {
+  let childEnv;
+  const spawnFn = (_execPath, _args, options) => {
+    childEnv = options.env;
+    return { on: (_event, cb) => cb(0, null) };
+  };
+  const code = await runner.runBuy("BNB/USDT", { market_address: "0xabc", event_day: "2026-06-01" }, {
+    amounts: { "BNB/USDT": "11" },
+    maxPrices: { "BNB/USDT": "0.22" },
+    spawnFn,
+    logFn: () => {},
+  });
+  assert.equal(code, 0);
+  assert.equal(childEnv.BUY_AMOUNT_USDT, "11");
+  assert.equal(childEnv.MAX_PRICE, "0.22");
+});
+
 test("real stats exclude demo and scheduler sources", () => {
   const db = new DatabaseSync(":memory:");
   try {
