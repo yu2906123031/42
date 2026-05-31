@@ -27,7 +27,15 @@ const {
 const { NonceManager, preflightAllowanceForBatch } = runner;
 const { initializeSchema, acquireAutoBuyLock, updateAutoBuyLock, recordExecution } = store;
 const { claimableBuysQuery } = claim;
-const { parseOutcomeRange, estimateDailyVolume, selectOutcome, generateOpeningSnipePlans, amountForPair } = generator;
+const {
+  parseOutcomeRange,
+  estimateDailyVolume,
+  detectVolumeRegime,
+  estimateDailyVolumeByRegime,
+  selectOutcome,
+  generateOpeningSnipePlans,
+  amountForPair,
+} = generator;
 
 test("prefetches approval inside configured window before market start", () => {
   const startTimestamp = 1_700_000_010;
@@ -327,48 +335,148 @@ test("estimateDailyVolume combines mocked Binance volume inputs", async () => {
   const estimate = await estimateDailyVolume("BNB/USDT", { fetchFn, now: new Date("2026-06-01T12:00:00Z") });
   assert.equal(estimate.recent7d_avg, 700);
   assert.equal(estimate.current_24h_volume, 1000);
-  assert.ok(estimate.predicted_volume > 900 && estimate.predicted_volume < 1200);
+  assert.equal(estimate.regime, "NORMAL");
+  assert.equal(estimate.raw_predicted_volume, 848);
+  assert.ok(estimate.predicted_volume > 670 && estimate.predicted_volume < 690);
 });
 
-test("estimateDailyVolume marks BNB spike regime and follows projected high-volume day", async () => {
-  const fetchFn = async (url) => ({
-    ok: true,
-    json: async () => {
-      if (url.includes("ticker/24hr")) return { quoteVolume: "1500" };
-      if (url.includes("interval=1d")) return [300, 310, 290, 320, 305, 295, 300, 900].map((v) => [0, 0, 0, 0, 0, 0, 0, String(v)]);
-      if (url.includes("interval=1h")) return Array.from({ length: 24 }, () => [0, 0, 0, 0, 0, 0, 0, "60"]);
-      throw new Error(url);
-    },
+test("BNB spike regime requires volume and volatility confirmation and selects highest bucket with half size", () => {
+  const regime = detectVolumeRegime({
+    pair: "BNB/USDT",
+    recent7dAvg: 300_000_000,
+    previousDayVolume: 261_000_000,
+    current24hVolume: 1_500_000_000,
+    currentUtcDayVolume: 800_000_000,
+    projectedFromToday: 1_600_000_000,
+    last1hVolume: 90_000_000,
+    recent1hAvg: 25_000_000,
+    last3hVolume: 270_000_000,
+    recent3hAvg: 75_000_000,
+    realizedVol1hRatio: 2.4,
+    realizedVol3hRatio: 2.1,
+    elapsedDayRatio: 0.5,
   });
-  const estimate = await estimateDailyVolume("BNB/USDT", { fetchFn, now: new Date("2026-06-01T12:00:00Z") });
-  assert.equal(estimate.regime, "spike");
-  assert.ok(estimate.volume_spike_ratio >= 2.5);
-  assert.ok(estimate.predicted_volume > 1400);
-});
-
-test("estimateDailyVolume marks post-spike cooldown and downweights stale rolling 24h volume", async () => {
-  const fetchFn = async (url) => ({
-    ok: true,
-    json: async () => {
-      if (url.includes("ticker/24hr")) return { quoteVolume: "1300" };
-      if (url.includes("interval=1d")) return [300, 310, 290, 320, 305, 295, 1500, 150].map((v) => [0, 0, 0, 0, 0, 0, 0, String(v)]);
-      if (url.includes("interval=1h")) return Array.from({ length: 24 }, () => [0, 0, 0, 0, 0, 0, 0, "10"]);
-      throw new Error(url);
-    },
+  assert.equal(regime.regime, "SPIKE");
+  assert.ok(regime.reasons.includes("volatility_confirmed"));
+  const prediction = estimateDailyVolumeByRegime({
+    pair: "BNB/USDT",
+    recent7dAvg: 300_000_000,
+    previousDayVolume: 261_000_000,
+    current24hVolume: 1_500_000_000,
+    currentUtcDayVolume: 800_000_000,
+    projectedFromToday: 1_600_000_000,
+    lastHoursMomentumProjected: 1_900_000_000,
+    elapsedDayRatio: 0.5,
+    regime,
   });
-  const estimate = await estimateDailyVolume("BNB/USDT", { fetchFn, now: new Date("2026-06-01T12:00:00Z") });
-  assert.equal(estimate.regime, "post_spike_cooldown");
-  assert.ok(estimate.predicted_volume < 700);
-});
-
-test("selectOutcome follows spike regime into top bucket and applies conservative boundary downgrade in normal regime", () => {
   const outcomes = [
-    { token_id: "low", outcome_name: "Below 500", lower: 0, upper: 500, price_hmr: 0.2 },
-    { token_id: "mid", outcome_name: "500 - 850", lower: 500, upper: 850, price_hmr: 0.25 },
-    { token_id: "top", outcome_name: "Above 850", lower: 850, upper: Infinity, price_hmr: 0.3 },
+    { token_id: "low", outcome_name: "Below $500M", lower: 0, upper: 500_000_000, price_hmr: 0.2 },
+    { token_id: "mid", outcome_name: "$500M - $850M", lower: 500_000_000, upper: 850_000_000, price_hmr: 0.25 },
+    { token_id: "top", outcome_name: "> $850M", lower: 850_000_000, upper: Infinity, price_hmr: 0.3 },
   ];
-  assert.equal(selectOutcome(outcomes, { predicted_volume: 940, projected_from_today: 1050, regime: "spike", data_complete: true }, { maxPrice: 0.45 }).token_id, "top");
-  assert.equal(selectOutcome(outcomes, { predicted_volume: 870, regime: "normal", data_complete: true }, { maxPrice: 0.45 }).token_id, "mid");
+  const selected = selectOutcome(outcomes, prediction, { pair: "BNB/USDT", maxPrice: 0.45, minConfidence: 0, baseBuyAmount: "2" });
+  assert.equal(selected.token_id, "top");
+  assert.equal(selected.downgrade_reasons.includes("opening_high_bucket_downgrade"), false);
+  assert.equal(selected.amount_factor, 0.5);
+});
+
+test("BNB post-spike cooldown ignores rolling 24h residue", () => {
+  const regime = detectVolumeRegime({
+    pair: "BNB/USDT",
+    recent7dAvg: 300_000_000,
+    previousDayVolume: 1_593_000_000,
+    current24hVolume: 1_300_000_000,
+    currentUtcDayVolume: 180_000_000,
+    projectedFromToday: 450_000_000,
+    last1hVolume: 10_000_000,
+    recent1hAvg: 20_000_000,
+    last3hVolume: 30_000_000,
+    recent3hAvg: 60_000_000,
+    realizedVol1hRatio: 0.8,
+    realizedVol3hRatio: 0.7,
+    elapsedDayRatio: 0.4,
+  });
+  assert.equal(regime.regime, "POST_SPIKE_COOLDOWN");
+  assert.ok(regime.reasons.includes("rolling_24h_residue_ignored"));
+  const prediction = estimateDailyVolumeByRegime({
+    pair: "BNB/USDT",
+    recent7dAvg: 300_000_000,
+    previousDayVolume: 1_593_000_000,
+    current24hVolume: 1_300_000_000,
+    currentUtcDayVolume: 180_000_000,
+    projectedFromToday: 450_000_000,
+    lastHoursMomentumProjected: 240_000_000,
+    elapsedDayRatio: 0.4,
+    regime,
+  });
+  assert.equal(prediction.regime, "POST_SPIKE_COOLDOWN");
+  assert.ok(prediction.regime_reasons.includes("rolling_24h_residue_ignored"));
+  assert.ok(prediction.conservative_predicted_volume < 500_000_000);
+});
+
+test("normal regime applies conservative and early-session discounts with lower-half downgrade", () => {
+  const regime = detectVolumeRegime({
+    pair: "BTC/USDT",
+    recent7dAvg: 10_000_000_000,
+    previousDayVolume: 9_000_000_000,
+    current24hVolume: 9_500_000_000,
+    currentUtcDayVolume: 2_000_000_000,
+    projectedFromToday: 9_000_000_000,
+    last1hVolume: 300_000_000,
+    recent1hAvg: 350_000_000,
+    last3hVolume: 900_000_000,
+    recent3hAvg: 1_050_000_000,
+    realizedVol1hRatio: 1.0,
+    realizedVol3hRatio: 1.0,
+    elapsedDayRatio: 0.25,
+  });
+  const prediction = estimateDailyVolumeByRegime({
+    pair: "BTC/USDT",
+    recent7dAvg: 10_000_000_000,
+    previousDayVolume: 9_000_000_000,
+    current24hVolume: 9_500_000_000,
+    currentUtcDayVolume: 2_000_000_000,
+    projectedFromToday: 9_000_000_000,
+    lastHoursMomentumProjected: 8_000_000_000,
+    elapsedDayRatio: 0.25,
+    regime,
+  });
+  assert.equal(prediction.regime, "NORMAL");
+  assert.ok(prediction.conservative_predicted_volume < prediction.raw_predicted_volume * 0.73);
+  const outcomes = [
+    { token_id: "low", outcome_name: "Below $5B", lower: 0, upper: 5_000_000_000, price_hmr: 0.2 },
+    { token_id: "mid", outcome_name: "$5B - $10B", lower: 5_000_000_000, upper: 10_000_000_000, price_hmr: 0.25 },
+    { token_id: "high", outcome_name: "> $10B", lower: 10_000_000_000, upper: Infinity, price_hmr: 0.3 },
+  ];
+  const selected = selectOutcome(outcomes, { ...prediction, conservative_predicted_volume: 5_600_000_000 }, { pair: "BTC/USDT", maxPrice: 0.45, minConfidence: 0 });
+  assert.equal(selected.token_id, "low");
+  assert.ok(selected.downgrade_reasons.includes("normal_lower_half_downgrade"));
+});
+
+test("allowSpikeMode false downgrades detected BTC spike to transition and blocks highest bucket chase", () => {
+  const regime = detectVolumeRegime({
+    pair: "BTC/USDT",
+    recent7dAvg: 10_000_000_000,
+    previousDayVolume: 9_000_000_000,
+    current24hVolume: 30_000_000_000,
+    currentUtcDayVolume: 15_000_000_000,
+    projectedFromToday: 32_000_000_000,
+    last1hVolume: 2_000_000_000,
+    recent1hAvg: 500_000_000,
+    last3hVolume: 6_000_000_000,
+    recent3hAvg: 1_500_000_000,
+    realizedVol1hRatio: 3,
+    realizedVol3hRatio: 2.5,
+    elapsedDayRatio: 0.5,
+  });
+  assert.equal(regime.regime, "TRANSITION");
+  assert.ok(regime.reasons.includes("pair_spike_disabled"));
+  const outcomes = [
+    { token_id: "mid", outcome_name: "$10B - $25B", lower: 10_000_000_000, upper: 25_000_000_000, price_hmr: 0.2 },
+    { token_id: "top", outcome_name: "> $25B", lower: 25_000_000_000, upper: Infinity, price_hmr: 0.2 },
+  ];
+  const selected = selectOutcome(outcomes, { regime: "TRANSITION", conservative_predicted_volume: 27_000_000_000, predicted_volume: 27_000_000_000, data_complete: true }, { pair: "BTC/USDT", maxPrice: 0.45, minConfidence: 0, maxOpeningBucketIndex: 0 });
+  assert.equal(selected.token_id, "mid");
 });
 
 test("amountForPair defaults BNB opening buys to 2 USDT", () => {
@@ -406,8 +514,13 @@ test("generator outputs plans array from mocked GraphQL and Binance data", async
     now: new Date("2026-06-01T12:00:00Z"),
     logFn: () => {},
   });
-  assert.equal(payload.plans.length, 1);
   assert.equal(payload.plans[0].selected_token_id, "1");
+  assert.equal(payload.plans[0].prediction.regime, "NORMAL");
+  assert.ok(Number.isFinite(payload.plans[0].prediction.volume_spike_ratio));
+  assert.ok(Array.isArray(payload.plans[0].prediction.regime_reasons));
+  assert.ok(Array.isArray(payload.plans[0].prediction.all_outcome_intervals));
+  assert.ok("raw_predicted_volume" in payload.plans[0].prediction);
+  assert.ok("conservative_predicted_volume" in payload.plans[0].prediction);
 });
 
 test("runner invokes opening plan generator before buys", async () => {

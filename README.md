@@ -49,6 +49,23 @@ npm run plan:aoe:opening
 
 常用 plan 配置：`AUTO_BUY_PAIRS`、`EVENT_DAY`、`GRAPHQL_URL`、`BINANCE_FAPI_URL`、`OPENING_SNIPE_PLAN_PATH`、`PLAN_MIN_CONFIDENCE`、`PLAN_MAX_PRICE`、`PLAN_ALLOW_LOW_CONFIDENCE`、`PRIMARY_BUY_USDT`、`BTC_BUY_USDT`、`SOL_BUY_USDT`、`ETH_BUY_USDT`。
 
+开盘 plan 先识别 volume regime，再选档：
+
+- `NORMAL`：保守均值回归，默认 `NORMAL_CONSERVATIVE_FACTOR=0.80`，早盘再额外降权。
+- `TRANSITION`：轻度保守，默认 `TRANSITION_CONSERVATIVE_FACTOR=0.90`，边界保护保留。
+- `SPIKE`：异常放量跟随，需要成交额与 1h/3h realized volatility 同时确认；默认允许最高档、关闭机械下调，并用 `SPIKE_BUY_AMOUNT_FACTOR=0.50` 半仓。
+- `POST_SPIKE_COOLDOWN`：异常后冷却，默认 `POST_SPIKE_CONSERVATIVE_FACTOR=0.85`，`current24hVolume` 权重只有 5%，重点看 UTC 当日与日内动量，避免 24h 残影误导。
+
+默认 pair profile：BNB 允许 `SPIKE`，BTC/SOL/ETH 的 spike 信号会降级为 `TRANSITION`，避免常规高估场景追高。相关阈值可用 `REGIME_NORMAL_SPIKE_RATIO`、`REGIME_SPIKE_RATIO`、`REGIME_INTRADAY_SPIKE_RATIO`、`REGIME_POST_SPIKE_DECAY_RATIO`、`REGIME_POST_SPIKE_MOMENTUM_RATIO`、`SPIKE_PROJECTED_CAP_MULTIPLIER` 调整。
+
+回测 regime 维度：
+
+```bash
+npm test
+PLAN_DRY_RUN=1 node scripts/aoe-opening-plan-generator.js
+node scripts/aoe-plan-backtest.js
+```
+
 人工验证时使用：
 
 ```bash
