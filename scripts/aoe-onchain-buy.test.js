@@ -27,7 +27,7 @@ const {
 const { NonceManager, preflightAllowanceForBatch } = runner;
 const { initializeSchema, acquireAutoBuyLock, updateAutoBuyLock, recordExecution } = store;
 const { claimableBuysQuery } = claim;
-const { parseOutcomeRange, estimateDailyVolume, selectOutcome, generateOpeningSnipePlans } = generator;
+const { parseOutcomeRange, estimateDailyVolume, selectOutcome, generateOpeningSnipePlans, amountForPair } = generator;
 
 test("prefetches approval inside configured window before market start", () => {
   const startTimestamp = 1_700_000_010;
@@ -330,6 +330,51 @@ test("estimateDailyVolume combines mocked Binance volume inputs", async () => {
   assert.ok(estimate.predicted_volume > 900 && estimate.predicted_volume < 1200);
 });
 
+test("estimateDailyVolume marks BNB spike regime and follows projected high-volume day", async () => {
+  const fetchFn = async (url) => ({
+    ok: true,
+    json: async () => {
+      if (url.includes("ticker/24hr")) return { quoteVolume: "1500" };
+      if (url.includes("interval=1d")) return [300, 310, 290, 320, 305, 295, 300, 900].map((v) => [0, 0, 0, 0, 0, 0, 0, String(v)]);
+      if (url.includes("interval=1h")) return Array.from({ length: 24 }, () => [0, 0, 0, 0, 0, 0, 0, "60"]);
+      throw new Error(url);
+    },
+  });
+  const estimate = await estimateDailyVolume("BNB/USDT", { fetchFn, now: new Date("2026-06-01T12:00:00Z") });
+  assert.equal(estimate.regime, "spike");
+  assert.ok(estimate.volume_spike_ratio >= 2.5);
+  assert.ok(estimate.predicted_volume > 1400);
+});
+
+test("estimateDailyVolume marks post-spike cooldown and downweights stale rolling 24h volume", async () => {
+  const fetchFn = async (url) => ({
+    ok: true,
+    json: async () => {
+      if (url.includes("ticker/24hr")) return { quoteVolume: "1300" };
+      if (url.includes("interval=1d")) return [300, 310, 290, 320, 305, 295, 1500, 150].map((v) => [0, 0, 0, 0, 0, 0, 0, String(v)]);
+      if (url.includes("interval=1h")) return Array.from({ length: 24 }, () => [0, 0, 0, 0, 0, 0, 0, "10"]);
+      throw new Error(url);
+    },
+  });
+  const estimate = await estimateDailyVolume("BNB/USDT", { fetchFn, now: new Date("2026-06-01T12:00:00Z") });
+  assert.equal(estimate.regime, "post_spike_cooldown");
+  assert.ok(estimate.predicted_volume < 700);
+});
+
+test("selectOutcome follows spike regime into top bucket and applies conservative boundary downgrade in normal regime", () => {
+  const outcomes = [
+    { token_id: "low", outcome_name: "Below 500", lower: 0, upper: 500, price_hmr: 0.2 },
+    { token_id: "mid", outcome_name: "500 - 850", lower: 500, upper: 850, price_hmr: 0.25 },
+    { token_id: "top", outcome_name: "Above 850", lower: 850, upper: Infinity, price_hmr: 0.3 },
+  ];
+  assert.equal(selectOutcome(outcomes, { predicted_volume: 940, projected_from_today: 1050, regime: "spike", data_complete: true }, { maxPrice: 0.45 }).token_id, "top");
+  assert.equal(selectOutcome(outcomes, { predicted_volume: 870, regime: "normal", data_complete: true }, { maxPrice: 0.45 }).token_id, "mid");
+});
+
+test("amountForPair defaults BNB opening buys to 2 USDT", () => {
+  assert.equal(amountForPair("BNB/USDT", {}), "2");
+});
+
 test("selectOutcome chooses containing range and respects price/confidence gates", () => {
   const outcomes = [
     { token_id: "1", outcome_name: "0-100", lower: 0, upper: 100, price_hmr: 0.2 },
@@ -362,7 +407,7 @@ test("generator outputs plans array from mocked GraphQL and Binance data", async
     logFn: () => {},
   });
   assert.equal(payload.plans.length, 1);
-  assert.equal(payload.plans[0].selected_token_id, "2");
+  assert.equal(payload.plans[0].selected_token_id, "1");
 });
 
 test("runner invokes opening plan generator before buys", async () => {

@@ -14,8 +14,8 @@ function symbolForPair(pair) {
   return pair.replace("/", "").toUpperCase();
 }
 
-function amountForPair(pair, env = process.env) {
-  if (pair === "BNB/USDT") return env.PRIMARY_BUY_USDT || env.AUTO_BUY_AMOUNT_USDT || "5";
+export function amountForPair(pair, env = process.env) {
+  if (pair === "BNB/USDT") return env.PRIMARY_BUY_USDT || env.BNB_BUY_USDT || env.AUTO_BUY_AMOUNT_USDT || "2";
   if (pair === "BTC/USDT") return env.BTC_BUY_USDT || "2";
   if (pair === "SOL/USDT") return env.SOL_BUY_USDT || "2";
   if (pair === "ETH/USDT") return env.ETH_BUY_USDT || "2";
@@ -77,13 +77,29 @@ export async function estimateDailyVolume(pair, { binanceFapiUrl = "https://fapi
   const recent7dAvg = recent7.reduce((a, b) => a + b, 0) / Math.max(recent7.length, 1);
   const current24hVolume = Number(ticker.quoteVolume || 0);
   const currentUtcDayVolume = dailyVolumes[dailyVolumes.length - 1] || 0;
+  const previousUtcDayVolume = dailyVolumes[dailyVolumes.length - 2] || 0;
   const elapsedDayRatio = ((now.getUTCHours() * 3600) + (now.getUTCMinutes() * 60) + now.getUTCSeconds()) / 86400;
   const projectedFromToday = currentUtcDayVolume / Math.max(elapsedDayRatio, 0.05);
   const hourlyVolumes = hourly.map(quoteAt).filter((v) => Number.isFinite(v) && v > 0);
   const recent1hAvg = hourlyVolumes.reduce((a, b) => a + b, 0) / Math.max(hourlyVolumes.length, 1);
   const last1hVolume = hourlyVolumes[hourlyVolumes.length - 1] || recent1hAvg || 0;
   const activityBoost = clamp(last1hVolume / Math.max(recent1hAvg, 1), 0.7, 1.3);
-  const predicted = (recent7dAvg * 0.50 + current24hVolume * 0.30 + projectedFromToday * 0.20) * activityBoost;
+  const volumeSpikeRatio = current24hVolume / Math.max(recent7dAvg, 1);
+  const todayProjectionRatio = projectedFromToday / Math.max(recent7dAvg, 1);
+  const previousDaySpikeRatio = previousUtcDayVolume / Math.max(recent7dAvg, 1);
+  const regime = previousDaySpikeRatio >= 2.5 && todayProjectionRatio < 1.8
+    ? "post_spike_cooldown"
+    : (volumeSpikeRatio >= 2.5 || todayProjectionRatio >= 2.5 ? "spike" : (volumeSpikeRatio >= 1.8 || todayProjectionRatio >= 1.8 ? "transition" : "normal"));
+  let predicted;
+  if (regime === "spike") {
+    predicted = (projectedFromToday * 0.60 + current24hVolume * 0.30 + recent7dAvg * 0.10) * activityBoost;
+  } else if (regime === "post_spike_cooldown") {
+    predicted = (projectedFromToday * 0.70 + recent7dAvg * 0.25 + current24hVolume * 0.05) * activityBoost;
+  } else if (regime === "transition") {
+    predicted = (projectedFromToday * 0.45 + current24hVolume * 0.25 + recent7dAvg * 0.30) * activityBoost;
+  } else {
+    predicted = (recent7dAvg * 0.55 + current24hVolume * 0.20 + projectedFromToday * 0.25) * activityBoost;
+  }
   return {
     predicted_volume: predicted,
     recent7d_avg: recent7dAvg,
@@ -91,6 +107,10 @@ export async function estimateDailyVolume(pair, { binanceFapiUrl = "https://fapi
     current_utc_day_volume: currentUtcDayVolume,
     projected_from_today: projectedFromToday,
     activity_boost: activityBoost,
+    volume_spike_ratio: volumeSpikeRatio,
+    today_projection_ratio: todayProjectionRatio,
+    previous_day_spike_ratio: previousDaySpikeRatio,
+    regime,
     data_complete: recent7.length >= 7 && hourlyVolumes.length >= 24 && current24hVolume > 0,
   };
 }
@@ -128,6 +148,23 @@ export function selectOutcome(outcomes, prediction, { maxPrice = 0.45, minConfid
   const eligible = outcomes.filter((outcome) => Number(outcome.price_hmr) <= Number(maxPrice));
   if (!eligible.length) return null;
   const predicted = prediction.predicted_volume;
+  const ordered = [...eligible].sort((a, b) => a.lower - b.lower);
+  if (prediction.regime === "normal") {
+    const containingIndex = ordered.findIndex((outcome) => predicted >= outcome.lower && predicted < outcome.upper);
+    const containing = ordered[containingIndex];
+    const previous = ordered[containingIndex - 1];
+    if (containing && previous) {
+      const previousWidth = Math.max(previous.upper - previous.lower, 1);
+      const nearLowerEdge = predicted - containing.lower < Math.max(previousWidth * 0.10, containing.lower * 0.03);
+      if (nearLowerEdge) {
+        const confidence = Math.max(
+          Number(minConfidence),
+          confidenceFor(previous, { ...prediction, predicted_volume: previous.lower + Math.max(previous.upper - previous.lower, 1) * 0.85 }, Number(maxPrice)),
+        );
+        return { ...previous, confidence };
+      }
+    }
+  }
   const ranked = eligible.map((outcome) => ({
     outcome,
     distance: distanceToRange(predicted, outcome),
