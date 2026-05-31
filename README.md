@@ -43,10 +43,18 @@ AOE_BUY_MODE=MANUAL DRY_RUN=1 \
   npm run buy:aoe:onchain
 ```
 
-并发自动买入使用 `NonceManager` 从 pending nonce 或 `BASE_BUY_NONCE` 分配连续 nonce；`auto_buy_locks` 按 `event_day + pair` 加锁，`AUTO_BUY_FORCE=1` 才会覆盖。`OPENING_EXECUTION_MODE=HYBRID` 为默认模式，`FAST_PRESIGN` 会启用开盘预签名。
+并发自动买入使用 `NonceManager` 从 pending nonce 或 `BASE_BUY_NONCE` 分配连续 nonce；`auto_buy_locks` 按 `event_day + pair` 加锁，`AUTO_BUY_FORCE=1` 才会覆盖，并记录 `nonce`、`error`、`tx_hash` 方便实盘复盘。
 
-Runner 在真实买入前会按本轮全部 pair 的 `buy_amount_usdt` 做一次 USDT allowance preflight。allowance 不足时只提交一次 Router `approve(MAX_UINT256)`，receipt 成功后子进程才会跳过各自的 allowance 检查。
+`OPENING_EXECUTION_MODE` 支持三种安全执行模式：
 
-成交记录会写入 market/token/outcome/event_day、nonce、graph/effective price、quote/minOut、plan_id 等上下文；`success` / `confirmed` 记录必须带 `tx_hash`。Dashboard 的实时 KPI、strategy 汇总和 `daily_stats` 只统计 `aoe-onchain-buy` / `aoe-auto-claim` 来源，demo、manual、scheduler 行通过 source 保留在明细中。
+- `HYBRID`：默认模式，先链上 quote/simulate，再提交交易；旧的 `PRE_SIGN_OPENING_TX` 在该模式下不会触发预签。只有明确设置 `HYBRID_PRESIGN_AFTER_QUOTE=1` 时，quote 之后才会走预签广播。
+- `SAFE_SIMULATE`：全程模拟优先，强制关闭预签，适合实盘前验证与保守运行。
+- `FAST_PRESIGN`：开盘前准备签名交易并在条件满足时广播，适合抢开盘成交，需配合更严格的计划、价格与 nonce 管理。
 
-Dashboard 写接口支持 `AOE_DASHBOARD_WRITE_TOKEN`：设置后，`POST /api/config` 与 `POST /api/executions` 必须携带 `x-aoe-dashboard-token`。CORS 默认限制到 localhost，可用 `AOE_DASHBOARD_ALLOWED_ORIGINS` 覆盖。
+Runner 在真实买入前会按本轮全部 pair 的 `buy_amount_usdt` 做一次 USDT allowance preflight。allowance 不足时只提交一次 Router `approve(MAX_UINT256)`，receipt 成功后会向子进程传递 `BATCH_APPROVAL_DONE`、`BATCH_APPROVAL_OWNER`、`BATCH_APPROVAL_TOTAL_WEI`、`BATCH_APPROVAL_TX`；子进程仅在 owner 匹配且本单金额被总额度覆盖时跳过 allowance 检查。
+
+成交记录会写入 market/token/outcome/event_day、nonce、graph/effective price、quote/minOut、plan_id 等上下文；`success` / `confirmed` 记录必须带 `tx_hash`。Dashboard 的实时 KPI、strategy 汇总和 `daily_stats` 只统计 `aoe-onchain-buy` / `aoe-auto-claim` 来源，demo、manual、scheduler 行通过 source 保留在明细中。Dashboard 余额字段在接入链上读取前返回 `null`，并标记 `walletBalanceSource` / `usdtBalanceSource` 为 `not_configured`，前端应隐藏假余额。
+
+Auto-claim 使用成交记录里的 `market_address` 与 `token_id` 精确查询 market 并执行 claim；历史记录缺少 market/token 绑定时只记录 `legacy_skip`。需要迁移旧数据时可临时设置 `LEGACY_CLAIM_ALLOW_DISCOVERY=1` 做人工受控发现。
+
+Dashboard 写接口支持 `AOE_DASHBOARD_WRITE_TOKEN`：设置后，`POST /api/config` 与 `POST /api/executions` 必须携带 `x-aoe-dashboard-token` 或 `Authorization: Bearer <token>`。CORS 默认限制到 localhost，可用 `AOE_DASHBOARD_ALLOWED_ORIGINS` 覆盖；生产环境未设置 token 时写接口返回 401。

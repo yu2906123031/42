@@ -38,7 +38,7 @@ function corsHeaders(req) {
   return {
     "access-control-allow-origin": allowOrigin,
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type,x-aoe-dashboard-token",
+    "access-control-allow-headers": "content-type,x-aoe-dashboard-token,authorization",
     "vary": "Origin",
   };
 }
@@ -62,8 +62,9 @@ function text(req, res, status, body, contentType = "text/plain; charset=utf-8")
 
 function requireWriteToken(req) {
   const token = process.env.AOE_DASHBOARD_WRITE_TOKEN;
-  if (!token) return true;
-  return req.headers["x-aoe-dashboard-token"] === token;
+  if (!token) return process.env.NODE_ENV !== "production";
+  const bearer = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i)?.[1];
+  return req.headers["x-aoe-dashboard-token"] === token || bearer === token;
 }
 
 function readBody(req) {
@@ -118,8 +119,10 @@ function kpi() {
     monthTurnover: monthStats.turnover,
     monthTrades: monthStats.trades,
     monthGas: monthStats.gas,
-    walletBalance: 3.4821,
-    usdtBalance: 18429.56,
+    walletBalance: null,
+    usdtBalance: null,
+    walletBalanceSource: "not_configured",
+    usdtBalanceSource: "not_configured",
     refreshedAt: new Date().toISOString(),
   };
 }
@@ -309,6 +312,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(port, () => {
+  if (!process.env.AOE_DASHBOARD_WRITE_TOKEN) {
+    console.warn("WARNING: AOE_DASHBOARD_WRITE_TOKEN is not set; dashboard POST endpoints are protected in production and open in local development.");
+    if (process.env.NODE_ENV === "production") console.warn("WARNING: production dashboard writes will return 401 until AOE_DASHBOARD_WRITE_TOKEN is configured.");
+  }
   console.log(`AOE Dashboard API listening on http://localhost:${port}`);
   console.log(`SQLite: runtime-state/trades.db`);
 });

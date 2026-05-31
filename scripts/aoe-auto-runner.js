@@ -62,7 +62,7 @@ export async function preflightAllowanceForBatch({ publicClient, walletClient, a
   if (!account) return { approved: false, skipped: true, reason: "missing_account" };
   const totalAmount = totalBuyAmountWei(pairs, amounts);
   const allowance = await publicClient.readContract({ address: COLLATERAL, abi: ERC20_ABI, functionName: "allowance", args: [account.address, ROUTER] });
-  if (!shouldApproveRouter(allowance, totalAmount)) return { approved: true, allowance, totalAmount, approvalSent: false };
+  if (!shouldApproveRouter(allowance, totalAmount)) return { approved: true, allowance, totalAmount, approvalSent: false, hash: "already-approved" };
   if (dryRun) {
     logFn(`DRY RUN: batch allowance ${allowance} below total buy amount ${totalAmount}; would approve MAX_UINT256.`);
     return { approved: true, allowance, totalAmount, approvalSent: false, dryRun: true };
@@ -174,7 +174,7 @@ function log(message, logFn = console.log) {
   logFn(`[${new Date().toISOString()}] ${message}`);
 }
 
-function runBuy(pair, market, { nonce } = {}) {
+function runBuy(pair, market, { nonce, batchApproval } = {}) {
   const env = {
     ...process.env,
     AOE_PAIR: pair,
@@ -185,7 +185,13 @@ function runBuy(pair, market, { nonce } = {}) {
     MAX_PRICE: process.env.AUTO_MAX_OUTCOME_PRICE || process.env.AUTO_BUY_MAX_PRICE || process.env.MAX_PRICE || "0.45",
     OPENING_EXECUTION_MODE: process.env.OPENING_EXECUTION_MODE || "HYBRID",
     ...(nonce == null ? {} : { BUY_NONCE: String(nonce) }),
-    ...(process.env.BATCH_APPROVAL_DONE === "1" ? { SKIP_APPROVAL_CHECK: "1", BATCH_APPROVAL_DONE: "1" } : {}),
+    ...(batchApproval?.approved ? {
+      SKIP_APPROVAL_CHECK: "1",
+      BATCH_APPROVAL_DONE: "1",
+      BATCH_APPROVAL_OWNER: batchApproval.owner,
+      BATCH_APPROVAL_TOTAL_WEI: String(batchApproval.totalAmount),
+      BATCH_APPROVAL_TX: batchApproval.hash || "already-approved",
+    } : {}),
   };
   console.log(`[${new Date().toISOString()}] buy start pair=${pair} market=${market.market_address} nonce=${env.BUY_NONCE ?? "auto"} amount=${env.BUY_AMOUNT_USDT} dryRun=${env.DRY_RUN}`);
   return new Promise((resolve) => {
@@ -205,6 +211,7 @@ export async function runBuysConcurrently({
   logFn = console.log,
 } = {}) {
   const nonceManager = await createNonceManager();
+  let batchApproval = null;
   if (!DRY_RUN && process.env.PRIVATE_KEY) {
     const urls = (process.env.BSC_RPC_URLS || process.env.BSC_RPC_URL || "https://bsc-rpc.publicnode.com").split(",").map((v) => v.trim()).filter(Boolean);
     const publicClient = createPublicClient({ chain: bsc, transport: fallback(urls.map((url) => http(url, { retryCount: 0, timeout: 8000 }))) });
@@ -212,7 +219,16 @@ export async function runBuysConcurrently({
     const walletClient = createWalletClient({ account, chain: bsc, transport: fallback(urls.map((url) => http(url, { retryCount: 0, timeout: 8000 }))) });
     const approval = await preflightAllowanceForBatch({ publicClient, walletClient, account, pairs, amounts: AMOUNTS, dryRun: DRY_RUN, logFn });
     if (!approval.approved) return pairs.map((pair) => ({ pair, status: "skipped", reason: "batch_approval_failed" }));
+    batchApproval = {
+      approved: true,
+      owner: account.address,
+      totalAmount: approval.totalAmount,
+      hash: approval.hash || "already-approved",
+    };
     process.env.BATCH_APPROVAL_DONE = "1";
+    process.env.BATCH_APPROVAL_OWNER = account.address;
+    process.env.BATCH_APPROVAL_TOTAL_WEI = String(approval.totalAmount);
+    process.env.BATCH_APPROVAL_TX = batchApproval.hash;
   }
   const jobs = pairs.map(async (pair) => {
     let lock = null;
@@ -230,9 +246,9 @@ export async function runBuysConcurrently({
       }
       const nonce = nonceManager?.allocate();
       updateAutoBuyLock(lock.lockId, { status: "running", nonce });
-      const code = await runBuyFn(pair, market, { nonce });
+      const code = await runBuyFn(pair, market, { nonce, batchApproval });
       const status = buyStatusFromCode(code);
-      updateAutoBuyLock(lock.lockId, { status, nonce });
+      updateAutoBuyLock(lock.lockId, { status, nonce, error: status === "failed" ? `child_exit_${code}` : null });
       return { pair, status, code, market: market.market_address, nonce };
     } catch (error) {
       if (lock?.lockId) updateAutoBuyLock(lock.lockId, { status: "failed", error: error.message });

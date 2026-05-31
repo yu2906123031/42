@@ -50,6 +50,9 @@ export function initializeSchema(database = getDb()) {
       pair TEXT NOT NULL,
       market_address TEXT,
       status TEXT NOT NULL,
+      nonce INTEGER,
+      error TEXT,
+      tx_hash TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       PRIMARY KEY(event_day, pair)
@@ -105,6 +108,11 @@ export function initializeSchema(database = getDb()) {
     ["buy_id", "buy_id INTEGER"],
     ["plan_id", "plan_id TEXT"],
   ]) ensureColumn(database, "executions", name, ddl);
+  for (const [name, ddl] of [
+    ["nonce", "nonce INTEGER"],
+    ["error", "error TEXT"],
+    ["tx_hash", "tx_hash TEXT"],
+  ]) ensureColumn(database, "auto_buy_locks", name, ddl);
 }
 
 export function acquireAutoBuyLock({ event_day, pair, market_address, status = "acquired", force = false }, database = getDb()) {
@@ -124,7 +132,8 @@ export function acquireAutoBuyLock({ event_day, pair, market_address, status = "
 export function updateAutoBuyLock(lockOrArgs, updates = {}, database = getDb()) {
   const lock = lockOrArgs?.event_day ? lockOrArgs : lockOrArgs?.lockId;
   if (!lock?.event_day || !lock?.pair) return;
-  database.prepare(`UPDATE auto_buy_locks SET status=COALESCE(?,status), market_address=COALESCE(?,market_address), updated_at=? WHERE event_day=? AND pair=?`).run(updates.status || null, updates.market_address || null, new Date().toISOString(), lock.event_day, lock.pair);
+  database.prepare(`UPDATE auto_buy_locks SET status=COALESCE(?,status), market_address=COALESCE(?,market_address), nonce=COALESCE(?,nonce), error=COALESCE(?,error), tx_hash=COALESCE(?,tx_hash), updated_at=? WHERE event_day=? AND pair=?`)
+    .run(updates.status || null, updates.market_address || null, updates.nonce == null ? null : Number(updates.nonce), updates.error || null, updates.tx_hash || null, new Date().toISOString(), lock.event_day, lock.pair);
 }
 
 export function recordExecution(input) {

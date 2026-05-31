@@ -20,9 +20,11 @@ const {
   assertEffectivePriceWithinMax,
   canSkipApprovalCheck,
   classifySwapFailure,
+  shouldPreSignOpeningTx,
+  shouldUsePreSign,
 } = onchain;
 const { NonceManager, preflightAllowanceForBatch } = runner;
-const { initializeSchema, acquireAutoBuyLock, recordExecution } = store;
+const { initializeSchema, acquireAutoBuyLock, updateAutoBuyLock, recordExecution } = store;
 const { claimableBuysQuery } = claim;
 
 test("prefetches approval inside configured window before market start", () => {
@@ -43,6 +45,15 @@ test("does not prefetch approval before configured window", () => {
     shouldPrefetchApproval({ status: "scheduled", start_timestamp: startTimestamp }, nowMs, 10_000),
     false,
   );
+});
+
+test("HYBRID opening mode does not pre-sign unless explicitly enabled", () => {
+  assert.equal(shouldPreSignOpeningTx(undefined), false);
+  assert.equal(shouldUsePreSign({ openingExecutionMode: "FAST_PRESIGN" }), true);
+  assert.equal(shouldUsePreSign({ openingExecutionMode: "SAFE_SIMULATE", preSignOpeningTxEnv: "1" }), false);
+  assert.equal(shouldUsePreSign({ openingExecutionMode: "HYBRID", preSignOpeningTxEnv: undefined }), false);
+  assert.equal(shouldUsePreSign({ openingExecutionMode: "HYBRID", preSignOpeningTxEnv: "1" }), false);
+  assert.equal(shouldUsePreSign({ openingExecutionMode: "HYBRID", hybridPresignAfterQuoteEnv: "1" }), true);
 });
 
 test("gas override multiplies current gas price", async () => {
@@ -153,6 +164,34 @@ test("claim query binds claims to buy_id and token_id from execution records", (
   assert.match(sql, /c\.buy_id = b\.id/);
 });
 
+test("auto-claim flow uses exact market address and skips pair date discovery", async () => {
+  const calls = [];
+  await claim.runAutoClaim({
+    env: { AUTO_CLAIM_ENABLED: "1", PRIVATE_KEY: "0x" + "1".repeat(64), AUTO_CLAIM_DRY_RUN: "1" },
+    claimableBuysFn: () => [{ id: 7, pair: "BNB/USDT", ts: "2026-06-01T00:00:00Z", market_address: "0xabc", token_id: "2", outcome_name: "UP", event_day: "2026-06-01" }],
+    clientsFn: async () => ({ publicClient: {}, walletClient: {} }),
+    getMarketByAddressFn: async (address) => { calls.push(["exact", address]); return { market_address: address, status: "finalised", outcomes: [{ token_id: "2", payout_hmr: "1", name: "UP" }] }; },
+    discoverMarketFn: async () => { throw new Error("legacy discovery should not be called"); },
+    claimOneFn: async ({ buy, market }) => { calls.push(["claim", buy.market_address, buy.token_id, market.market_address]); },
+    logFn: () => {},
+  });
+  assert.deepEqual(calls, [["exact", "0xabc"], ["claim", "0xabc", "2", "0xabc"]]);
+});
+
+test("auto-claim skips legacy buy rows without market binding", async () => {
+  const calls = [];
+  await claim.runAutoClaim({
+    env: { AUTO_CLAIM_ENABLED: "1", PRIVATE_KEY: "0x" + "1".repeat(64), AUTO_CLAIM_DRY_RUN: "1" },
+    claimableBuysFn: () => [{ id: 8, pair: "BNB/USDT", ts: "2026-06-01T00:00:00Z", market_address: null, token_id: null }],
+    clientsFn: async () => ({ publicClient: {}, walletClient: {} }),
+    getMarketByAddressFn: async () => { calls.push("exact"); },
+    discoverMarketFn: async () => { calls.push("discover"); },
+    claimOneFn: async () => { calls.push("claim"); },
+    logFn: (msg) => { if (msg.includes("legacy_skip")) calls.push("legacy_skip"); },
+  });
+  assert.deepEqual(calls, ["legacy_skip"]);
+});
+
 
 test("batch allowance approves once when allowance is below total amount", async () => {
   const calls = [];
@@ -195,9 +234,22 @@ test("batch allowance blocks buys when approval receipt is not successful", asyn
   assert.equal(result.approved, false);
 });
 
-test("SKIP_APPROVAL_CHECK is only honored after runner batch approval", () => {
-  assert.equal(canSkipApprovalCheck({ SKIP_APPROVAL_CHECK: "1" }), false);
-  assert.equal(canSkipApprovalCheck({ SKIP_APPROVAL_CHECK: "1", BATCH_APPROVAL_DONE: "1" }), true);
+test("SKIP_APPROVAL_CHECK is only honored for matching owner and covered amount", () => {
+  assert.equal(canSkipApprovalCheck({ SKIP_APPROVAL_CHECK: "1" }, { account: { address: "0xabc" }, amountWei: 2n }), false);
+  assert.equal(canSkipApprovalCheck({ SKIP_APPROVAL_CHECK: "1", BATCH_APPROVAL_DONE: "1", BATCH_APPROVAL_OWNER: "0xdef", BATCH_APPROVAL_TOTAL_WEI: "10" }, { account: { address: "0xabc" }, amountWei: 2n }), false);
+  assert.equal(canSkipApprovalCheck({ SKIP_APPROVAL_CHECK: "1", BATCH_APPROVAL_DONE: "1", BATCH_APPROVAL_OWNER: "0xabc", BATCH_APPROVAL_TOTAL_WEI: "1" }, { account: { address: "0xabc" }, amountWei: 2n }), false);
+  assert.equal(canSkipApprovalCheck({ SKIP_APPROVAL_CHECK: "1", BATCH_APPROVAL_DONE: "1", BATCH_APPROVAL_OWNER: "0xAbC", BATCH_APPROVAL_TOTAL_WEI: "10" }, { account: { address: "0xabc" }, amountWei: 2n }), true);
+});
+
+test("auto-buy lock stores nonce error and tx hash updates", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    initializeSchema(db);
+    const lock = acquireAutoBuyLock({ event_day: "2026-06-02", pair: "BNB/USDT", market_address: "0x111" }, db);
+    updateAutoBuyLock(lock.lockId, { status: "failed", nonce: 42, error: "boom", tx_hash: "0xtx" }, db);
+    const row = db.prepare("SELECT nonce,error,tx_hash,status FROM auto_buy_locks WHERE event_day=? AND pair=?").get("2026-06-02", "BNB/USDT");
+    assert.deepEqual({ ...row }, { nonce: 42, error: "boom", tx_hash: "0xtx", status: "failed" });
+  } finally { db.close(); }
 });
 
 test("executions migration keeps old rows and adds context columns", () => {

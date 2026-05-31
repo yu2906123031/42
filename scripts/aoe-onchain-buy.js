@@ -118,7 +118,11 @@ const config = {
   slippageBps: parseSlippageBps(process.env.SLIPPAGE_BPS),
   gasPriceMultiplierBps: BigInt(process.env.GAS_PRICE_MULTIPLIER_BPS || "15000"),
   openingExecutionMode: (process.env.OPENING_EXECUTION_MODE || "HYBRID").toUpperCase(),
-  preSignOpeningTx: (process.env.OPENING_EXECUTION_MODE || "HYBRID").toUpperCase() === "FAST_PRESIGN" || shouldPreSignOpeningTx(process.env.PRE_SIGN_OPENING_TX),
+  preSignOpeningTx: shouldUsePreSign({
+    openingExecutionMode: process.env.OPENING_EXECUTION_MODE || "HYBRID",
+    preSignOpeningTxEnv: process.env.PRE_SIGN_OPENING_TX,
+    hybridPresignAfterQuoteEnv: process.env.HYBRID_PRESIGN_AFTER_QUOTE,
+  }),
   preSignGasLimit: BigInt(process.env.PRE_SIGN_GAS_LIMIT || "650000"),
   rawTxFanoutLimit: Number(process.env.RAW_TX_FANOUT_LIMIT || "0"),
   collateral: "0x55d398326f99059ff775485246999027b3197955",
@@ -256,8 +260,16 @@ export function approvalAmountForRouter() {
   return MAX_UINT256;
 }
 
-export function canSkipApprovalCheck(env = process.env) {
-  return env.SKIP_APPROVAL_CHECK === "1" && env.BATCH_APPROVAL_DONE === "1";
+export function canSkipApprovalCheck(env = process.env, { account, amountWei } = {}) {
+  if (env.SKIP_APPROVAL_CHECK !== "1" || env.BATCH_APPROVAL_DONE !== "1") return false;
+  if (!account?.address || !env.BATCH_APPROVAL_OWNER) return false;
+  if (String(env.BATCH_APPROVAL_OWNER).toLowerCase() !== String(account.address).toLowerCase()) return false;
+  if (amountWei == null || env.BATCH_APPROVAL_TOTAL_WEI == null) return false;
+  try {
+    return BigInt(amountWei) <= BigInt(env.BATCH_APPROVAL_TOTAL_WEI);
+  } catch {
+    return false;
+  }
 }
 
 export function decodeRouterErrorName(data) {
@@ -278,8 +290,16 @@ export function parseSlippageBps(value) {
 }
 
 export function shouldPreSignOpeningTx(value) {
-  if (value === undefined || value === null || value === "") return true;
-  return !["0", "false", "no", "off"].includes(String(value).trim().toLowerCase());
+  if (value === undefined || value === null || value === "") return false;
+  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
+}
+
+export function shouldUsePreSign({ openingExecutionMode, preSignOpeningTxEnv, hybridPresignAfterQuoteEnv } = {}) {
+  const mode = String(openingExecutionMode || "HYBRID").toUpperCase();
+  if (mode === "FAST_PRESIGN") return true;
+  if (mode === "SAFE_SIMULATE") return false;
+  if (mode === "HYBRID") return shouldPreSignOpeningTx(hybridPresignAfterQuoteEnv);
+  return shouldPreSignOpeningTx(preSignOpeningTxEnv);
 }
 
 export function classifyRawTxBroadcastError(error) {
@@ -616,7 +636,7 @@ export function shouldPrefetchApproval(market, nowMs = Date.now(), preApprovalMs
 }
 
 async function approveIfNeeded(publicClient, walletClient, account, amountWei) {
-  if (canSkipApprovalCheck()) {
+  if (canSkipApprovalCheck(process.env, { account, amountWei })) {
     console.log("Batch approval completed by runner; skipping child allowance check.");
     return true;
   }

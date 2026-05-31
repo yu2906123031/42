@@ -50,6 +50,16 @@ const config = {
   targetTokenId: BigInt(process.env.TARGET_TOKEN_ID || "4"),
 };
 
+const MARKET_BY_ADDRESS_QUERY = `
+query MarketByAddress($address: String!) {
+  home_market_list(where: { market_address: { _eq: $address } }, limit: 1) {
+    title
+    status
+    market_address
+    outcomes
+  }
+}`;
+
 const MARKET_QUERY = `
 query DiscoverMarket($pattern: String!) {
   home_market_list(where: { title: { _ilike: $pattern } }, limit: 20) {
@@ -136,6 +146,18 @@ async function queryMarkets(pair, eventDate) {
   return json?.data?.home_market_list || [];
 }
 
+export async function getMarketByAddress(marketAddress) {
+  const response = await fetch(config.graphqlUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ query: MARKET_BY_ADDRESS_QUERY, variables: { address: marketAddress } }),
+  });
+  if (!response.ok) throw new Error(`GraphQL HTTP ${response.status}`);
+  const json = await response.json();
+  if (json.errors?.length) throw new Error(json.errors.map((error) => error.message).join("; "));
+  return json?.data?.home_market_list?.[0] || null;
+}
+
 async function discoverMarket(pair, eventDate) {
   const markets = await queryMarkets(pair, eventDate);
   return markets
@@ -182,9 +204,10 @@ function claimableBuys() {
 }
 
 async function claimOne({ buy, market, account, publicClient, walletClient }) {
-  const tokenId = BigInt(buy.token_id ?? buy.target_token_id ?? config.targetTokenId);
+  const marketAddress = buy.market_address;
+  const tokenId = BigInt(buy.token_id);
   const balance = await publicClient.readContract({
-    address: market.market_address,
+    address: marketAddress,
     abi: marketAbi,
     functionName: "balanceOf",
     args: [account.address, tokenId],
@@ -194,27 +217,27 @@ async function claimOne({ buy, market, account, publicClient, walletClient }) {
     return;
   }
   const state = await publicClient.readContract({
-    address: market.market_address,
+    address: marketAddress,
     abi: marketAbi,
     functionName: "readState",
   });
   if (!state.isFinalised) {
-    console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} market=${market.market_address} reason=market_not_finalised_onchain answer=${state.answer.toString()}`);
+    console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} market=${marketAddress} reason=market_not_finalised_onchain answer=${state.answer.toString()}`);
     return;
   }
   if (BigInt(state.answer) !== tokenId) {
-    console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} market=${market.market_address} reason=target_not_winning answer=${state.answer.toString()} target=${tokenId.toString()}`);
+    console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} market=${marketAddress} reason=target_not_winning answer=${state.answer.toString()} target=${tokenId.toString()}`);
     return;
   }
   const outcome = market.outcomes.find((item) => BigInt(item.token_id) === tokenId);
   const estimatedPayout = Number(formatUnits(balance, 18)) * Number(outcome?.payout_hmr || 0);
-  console.log(`[${new Date().toISOString()}] claim ready pair=${buy.pair} buy_id=${buy.id} market=${market.market_address} ot=${formatUnits(balance, 18)} est_usdt=${estimatedPayout.toFixed(6)} dryRun=${config.dryRun}`);
+  console.log(`[${new Date().toISOString()}] claim ready pair=${buy.pair} buy_id=${buy.id} market=${marketAddress} ot=${formatUnits(balance, 18)} est_usdt=${estimatedPayout.toFixed(6)} dryRun=${config.dryRun}`);
   if (config.dryRun) return;
 
   const startedAt = Date.now();
   const { request } = await publicClient.simulateContract({
     account,
-    address: market.market_address,
+    address: marketAddress,
     abi: marketAbi,
     functionName: "claim",
     args: [account.address, [tokenId], [balance]],
@@ -230,7 +253,7 @@ async function claimOne({ buy, market, account, publicClient, walletClient }) {
     duration_ms: Date.now() - startedAt,
     source: "aoe-auto-claim",
     buy_id: buy.id,
-    market_address: market.market_address,
+    market_address: marketAddress,
     token_id: tokenId.toString(),
     outcome_name: buy.outcome_name || outcome?.name || null,
     event_day: buy.event_day || null,
@@ -239,26 +262,42 @@ async function claimOne({ buy, market, account, publicClient, walletClient }) {
   console.log(`[${new Date().toISOString()}] claim finished pair=${buy.pair} buy_id=${buy.id} tx=${receipt.transactionHash} status=${receipt.status}`);
 }
 
-export async function runAutoClaim() {
-  console.log(`[${new Date().toISOString()}] auto-claim start enabled=${config.enabled} dryRun=${config.dryRun}`);
-  if (!config.enabled) return;
-  if (!config.privateKey || /^0x0+$/.test(config.privateKey)) throw new Error("Set PRIVATE_KEY in .env or environment first.");
-  const account = privateKeyToAccount(config.privateKey);
-  const { publicClient, walletClient } = await clients(account);
-  const buys = claimableBuys().filter((buy) => config.buyId == null || Number(buy.id) === config.buyId);
-  console.log(`[${new Date().toISOString()}] auto-claim candidates=${buys.length}${config.buyId == null ? "" : ` buy_id=${config.buyId}`}`);
+export async function runAutoClaim({
+  env = process.env,
+  claimableBuysFn = claimableBuys,
+  clientsFn = clients,
+  getMarketByAddressFn = getMarketByAddress,
+  discoverMarketFn = discoverMarket,
+  claimOneFn = claimOne,
+  logFn = console.log,
+} = {}) {
+  const enabled = !["0", "false", "no", "off"].includes(String(env.AUTO_CLAIM_ENABLED || "1").toLowerCase());
+  const privateKey = env.PRIVATE_KEY || config.privateKey;
+  logFn(`[${new Date().toISOString()}] auto-claim start enabled=${enabled} dryRun=${config.dryRun}`);
+  if (!enabled) return;
+  if (!privateKey || /^0x0+$/.test(privateKey)) throw new Error("Set PRIVATE_KEY in .env or environment first.");
+  const account = privateKeyToAccount(privateKey);
+  const { publicClient, walletClient } = await clientsFn(account);
+  const allowLegacyDiscovery = env.LEGACY_CLAIM_ALLOW_DISCOVERY === "1";
+  const buys = claimableBuysFn().filter((buy) => config.buyId == null || Number(buy.id) === config.buyId);
+  logFn(`[${new Date().toISOString()}] auto-claim candidates=${buys.length}${config.buyId == null ? "" : ` buy_id=${config.buyId}`}`);
   for (const buy of buys) {
-    const eventDate = new Date(buy.ts);
-    const market = await discoverMarket(buy.pair, eventDate);
+    if (!buy.market_address || buy.token_id == null || buy.token_id === "") {
+      logFn(`[${new Date().toISOString()}] claim legacy_skip pair=${buy.pair} buy_id=${buy.id} reason=missing_market_or_token`);
+      if (!allowLegacyDiscovery) continue;
+    }
+    const market = buy.market_address
+      ? await getMarketByAddressFn(buy.market_address)
+      : await discoverMarketFn(buy.pair, new Date(buy.ts));
     if (!market) {
-      console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} reason=market_not_found`);
+      logFn(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} reason=market_not_found`);
       continue;
     }
     if (!shouldClaimBuy(buy, market)) {
-      console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} status=${market.status} reason=not_finalised_or_not_winner`);
+      logFn(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} status=${market.status} reason=not_finalised_or_not_winner`);
       continue;
     }
-    await claimOne({ buy, market, account, publicClient, walletClient });
+    await claimOneFn({ buy, market, account, publicClient, walletClient });
   }
 }
 
