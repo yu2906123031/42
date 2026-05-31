@@ -336,8 +336,8 @@ test("estimateDailyVolume combines mocked Binance volume inputs", async () => {
   assert.equal(estimate.recent7d_avg, 700);
   assert.equal(estimate.current_24h_volume, 1000);
   assert.equal(estimate.regime, "NORMAL");
-  assert.equal(estimate.raw_predicted_volume, 848);
-  assert.ok(estimate.predicted_volume > 670 && estimate.predicted_volume < 690);
+  assert.equal(estimate.raw_predicted_volume, 734.25);
+  assert.ok(estimate.predicted_volume > 580 && estimate.predicted_volume < 590);
 });
 
 test("BNB spike regime requires volume and volatility confirmation and selects highest bucket with half size", () => {
@@ -414,6 +414,41 @@ test("BNB post-spike cooldown ignores rolling 24h residue", () => {
   assert.ok(prediction.conservative_predicted_volume < 500_000_000);
 });
 
+test("regime-specific projectedFromToday caps are exposed in prediction", () => {
+  const base = {
+    pair: "BNB/USDT",
+    recent7dAvg: 100,
+    previousDayVolume: 100,
+    current24hVolume: 100,
+    currentUtcDayVolume: 100,
+    projectedFromToday: 1_000,
+    lastHoursMomentumProjected: 100,
+    elapsedDayRatio: 0.5,
+  };
+  assert.equal(estimateDailyVolumeByRegime({ ...base, regime: { regime: "NORMAL", reasons: [] } }).projected_from_today_capped, 125);
+  assert.equal(estimateDailyVolumeByRegime({ ...base, regime: { regime: "POST_SPIKE_COOLDOWN", reasons: [] } }).projected_from_today_capped, 120);
+  assert.equal(estimateDailyVolumeByRegime({ ...base, regime: { regime: "TRANSITION", reasons: [] } }).projected_from_today_capped, 180);
+  assert.equal(estimateDailyVolumeByRegime({ ...base, regime: { regime: "SPIKE", reasons: [] } }).projected_from_today_capped, 600);
+});
+
+test("upper boundary guard skips normal ranges unless explicitly allowed", () => {
+  const outcomes = [
+    { token_id: "low", outcome_name: "0-100", lower: 0, upper: 100, price_hmr: 0.2 },
+    { token_id: "mid", outcome_name: "100-200", lower: 100, upper: 200, price_hmr: 0.2 },
+  ];
+  const prediction = { regime: "NORMAL", conservative_predicted_volume: 176, predicted_volume: 176, data_complete: true };
+  assert.equal(selectOutcome(outcomes, prediction, { maxPrice: 0.45, minConfidence: 0 }), null);
+  const allowed = selectOutcome(outcomes, prediction, { maxPrice: 0.45, minConfidence: 0, env: { ALLOW_UPPER_BOUNDARY_BUY: "1" } });
+  assert.equal(allowed.token_id, "mid");
+});
+
+test("selectOutcome default min confidence is 65", () => {
+  const outcomes = [
+    { token_id: "mid", outcome_name: "100-200", lower: 100, upper: 200, price_hmr: 0.4 },
+  ];
+  assert.equal(selectOutcome(outcomes, { predicted_volume: 120, data_complete: false }, { maxPrice: 0.45 }), null);
+});
+
 test("normal regime applies conservative and early-session discounts with lower-half downgrade", () => {
   const regime = detectVolumeRegime({
     pair: "BTC/USDT",
@@ -448,7 +483,7 @@ test("normal regime applies conservative and early-session discounts with lower-
     { token_id: "mid", outcome_name: "$5B - $10B", lower: 5_000_000_000, upper: 10_000_000_000, price_hmr: 0.25 },
     { token_id: "high", outcome_name: "> $10B", lower: 10_000_000_000, upper: Infinity, price_hmr: 0.3 },
   ];
-  const selected = selectOutcome(outcomes, { ...prediction, conservative_predicted_volume: 5_600_000_000 }, { pair: "BTC/USDT", maxPrice: 0.45, minConfidence: 0 });
+  const selected = selectOutcome(outcomes, { ...prediction, conservative_predicted_volume: 5_600_000_000 }, { pair: "BTC/USDT", maxPrice: 0.45, minConfidence: 0, env: { ALLOW_UPPER_BOUNDARY_BUY: "1" } });
   assert.equal(selected.token_id, "low");
   assert.ok(selected.downgrade_reasons.includes("normal_lower_half_downgrade"));
 });
@@ -475,7 +510,7 @@ test("allowSpikeMode false downgrades detected BTC spike to transition and block
     { token_id: "mid", outcome_name: "$10B - $25B", lower: 10_000_000_000, upper: 25_000_000_000, price_hmr: 0.2 },
     { token_id: "top", outcome_name: "> $25B", lower: 25_000_000_000, upper: Infinity, price_hmr: 0.2 },
   ];
-  const selected = selectOutcome(outcomes, { regime: "TRANSITION", conservative_predicted_volume: 27_000_000_000, predicted_volume: 27_000_000_000, data_complete: true }, { pair: "BTC/USDT", maxPrice: 0.45, minConfidence: 0, maxOpeningBucketIndex: 0 });
+  const selected = selectOutcome(outcomes, { regime: "TRANSITION", conservative_predicted_volume: 27_000_000_000, predicted_volume: 27_000_000_000, data_complete: true }, { pair: "BTC/USDT", maxPrice: 0.45, minConfidence: 0, maxOpeningBucketIndex: 0, env: { ALLOW_UPPER_BOUNDARY_BUY: "1" } });
   assert.equal(selected.token_id, "mid");
 });
 
@@ -489,7 +524,7 @@ test("selectOutcome chooses containing range and respects price/confidence gates
     { token_id: "2", outcome_name: "100-200", lower: 100, upper: 200, price_hmr: 0.3 },
   ];
   assert.equal(selectOutcome(outcomes, { predicted_volume: 150, data_complete: true }, { maxPrice: 0.45 }).token_id, "2");
-  assert.equal(selectOutcome(outcomes, { predicted_volume: 150, data_complete: true }, { maxPrice: 0.25, minConfidence: 0 })?.token_id, "1");
+  assert.equal(selectOutcome(outcomes, { predicted_volume: 150, data_complete: true }, { maxPrice: 0.25, minConfidence: 0, env: { ALLOW_UPPER_BOUNDARY_BUY: "1" } })?.token_id, "1");
   assert.equal(selectOutcome(outcomes, { predicted_volume: 150, data_complete: true }, { maxPrice: 0.1 }), null);
   assert.equal(selectOutcome(outcomes, { predicted_volume: 99, data_complete: false }, { maxPrice: 0.45, minConfidence: 95 }), null);
 });
@@ -509,7 +544,7 @@ test("generator outputs plans array from mocked GraphQL and Binance data", async
     },
   });
   const payload = await generateOpeningSnipePlans({
-    env: { AUTO_BUY_PAIRS: "BNB/USDT", EVENT_DAY: "2026-06-01", PLAN_DRY_RUN: "1" },
+    env: { AUTO_BUY_PAIRS: "BNB/USDT", EVENT_DAY: "2026-06-01", PLAN_DRY_RUN: "1", ALLOW_UPPER_BOUNDARY_BUY: "1" },
     fetchFn,
     now: new Date("2026-06-01T12:00:00Z"),
     logFn: () => {},

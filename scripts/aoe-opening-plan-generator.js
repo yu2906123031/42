@@ -168,13 +168,19 @@ export function estimateDailyVolumeByRegime(data, env = process.env) {
   const projectedFromToday = Number(data.projectedFromToday || 0);
   const elapsedDayRatio = Number(data.elapsedDayRatio || 0);
   const lastHoursMomentumProjected = Number(data.lastHoursMomentumProjected || projectedFromToday || 0);
-  const projectedFromTodayCapped = clamp(projectedFromToday, recent7dAvg * 0.50, recent7dAvg * 2.50);
-  const projectedFromTodayCappedForSpike = clamp(projectedFromToday, recent7dAvg * 0.80, recent7dAvg * envNumber(env, "SPIKE_PROJECTED_CAP_MULTIPLIER", 6.0));
+  const projectedCaps = {
+    NORMAL: [0.50, 1.25],
+    TRANSITION: [0.60, 1.80],
+    POST_SPIKE_COOLDOWN: [0.50, 1.20],
+    SPIKE: [0.80, envNumber(env, "SPIKE_PROJECTED_CAP_MULTIPLIER", 6.0)],
+  };
+  const [projectedFloor, projectedCap] = projectedCaps[regime] || projectedCaps.NORMAL;
+  const projectedFromTodayCapped = clamp(projectedFromToday, recent7dAvg * projectedFloor, recent7dAvg * projectedCap);
   const profile = profileFor(data.pair);
   let rawPredicted;
   let factor;
   if (regime === "SPIKE") {
-    rawPredicted = recent7dAvg * 0.10 + current24hVolume * 0.20 + projectedFromTodayCappedForSpike * 0.45 + lastHoursMomentumProjected * 0.25;
+    rawPredicted = recent7dAvg * 0.10 + current24hVolume * 0.20 + projectedFromTodayCapped * 0.45 + lastHoursMomentumProjected * 0.25;
     factor = envNumber(env, "SPIKE_CONSERVATIVE_FACTOR", 0.95);
   } else if (regime === "POST_SPIKE_COOLDOWN") {
     rawPredicted = recent7dAvg * 0.30 + current24hVolume * 0.05 + projectedFromTodayCapped * 0.45 + lastHoursMomentumProjected * 0.20;
@@ -197,6 +203,7 @@ export function estimateDailyVolumeByRegime(data, env = process.env) {
     current_24h_volume: current24hVolume,
     current_utc_day_volume: data.currentUtcDayVolume,
     projected_from_today: projectedFromToday,
+    projected_from_today_capped: projectedFromTodayCapped,
     last_hours_momentum_projected: lastHoursMomentumProjected,
     regime,
     volume_spike_ratio: regimeInfo.volume_spike_ratio,
@@ -281,7 +288,7 @@ function attachSelection(outcome, meta) {
   return { ...outcome, ...meta };
 }
 
-export function selectOutcome(outcomes, prediction, { pair = "", maxPrice = 0.45, minConfidence = 60, allowLowConfidence = false, maxOpeningBucketIndex = null, env = process.env } = {}) {
+export function selectOutcome(outcomes, prediction, { pair = "", maxPrice = 0.45, minConfidence = 65, allowLowConfidence = false, maxOpeningBucketIndex = null, env = process.env } = {}) {
   const orderedAll = [...outcomes].sort((a, b) => a.lower - b.lower);
   const allIntervals = outcomeIntervals(orderedAll);
   const priced = orderedAll.filter((outcome) => Number(outcome.price_hmr) <= Number(maxPrice));
@@ -334,8 +341,22 @@ export function selectOutcome(outcomes, prediction, { pair = "", maxPrice = 0.45
   }
 
   if (!selected) return null;
+  if (!truthy(env.ALLOW_UPPER_BOUNDARY_BUY) && regime !== "SPIKE" && Number.isFinite(selected.upper)) {
+    const width = Math.max(selected.upper - selected.lower, 1);
+    const positionInRange = (predicted - selected.lower) / width;
+    const upperBoundaryLimit = regime === "TRANSITION" ? 0.85 : 0.75;
+    if (positionInRange > upperBoundaryLimit) {
+      prediction.skipReason = "near_upper_boundary_skip";
+      prediction.skip_reason = "near_upper_boundary_skip";
+      return null;
+    }
+  }
   const confidence = confidenceFor(selected, prediction, Number(maxPrice));
-  if (confidence < Number(minConfidence) && !allowLowConfidence) return null;
+  if (confidence < Number(minConfidence) && !allowLowConfidence) {
+    prediction.skipReason = "low_confidence";
+    prediction.skip_reason = "low_confidence";
+    return null;
+  }
   const selectedIndex = orderedAll.indexOf(selected);
   return attachSelection(selected, {
     confidence,
@@ -397,7 +418,7 @@ export async function generateOpeningSnipePlans({ env = process.env, fetchFn = f
   const graphqlUrl = env.GRAPHQL_URL || "https://ft.42.space/v1/graphql";
   const binanceFapiUrl = env.BINANCE_FAPI_URL || "https://fapi.binance.com";
   const outputPath = env.OPENING_SNIPE_PLAN_PATH || "runtime-state/opening_snipe_plans.json";
-  const minConfidence = Number(env.PLAN_MIN_CONFIDENCE || 60);
+  const minConfidence = Number(env.PLAN_MIN_CONFIDENCE || 65);
   const maxPrice = Number(env.PLAN_MAX_PRICE || env.AUTO_MAX_OUTCOME_PRICE || 0.45);
   const maxOpeningBucketIndex = env.MAX_OPENING_BUCKET_INDEX == null ? null : Number(env.MAX_OPENING_BUCKET_INDEX);
   const minBuyUsdt = envNumber(env, "MIN_BUY_USDT", 1);
@@ -410,7 +431,7 @@ export async function generateOpeningSnipePlans({ env = process.env, fetchFn = f
       const prediction = await estimateDailyVolume(pair, { binanceFapiUrl, fetchFn, now, env });
       const baseAmount = Number(amountForPair(pair, env));
       const selected = selectOutcome(outcomes, prediction, { pair, maxPrice, minConfidence, allowLowConfidence: truthy(env.PLAN_ALLOW_LOW_CONFIDENCE), maxOpeningBucketIndex, env });
-      if (!selected) { logFn(`plan skip pair=${pair} reason=no_confident_price_eligible_outcome`); continue; }
+      if (!selected) { logFn(`plan skip pair=${pair} reason=${prediction.skipReason || prediction.skip_reason || "no_confident_price_eligible_outcome"}`); continue; }
       const amountFactor = selected.amount_factor ?? prediction.amount_factor ?? 1;
       const buyAmount = Math.max(minBuyUsdt, baseAmount * amountFactor);
       plans.push({
