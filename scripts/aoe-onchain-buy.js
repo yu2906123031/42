@@ -58,9 +58,10 @@ export function validateOpeningSnipePlan(plan) {
 
 export function resolveBuyPlan({ env = process.env, cwd = process.cwd() } = {}) {
   const mode = (env.AOE_BUY_MODE || env.BUY_MODE || "AUTO").toUpperCase();
+  const requirePlan = !["0", "false", "no", "off"].includes(String(env.AUTO_BUY_REQUIRE_PLAN || "1").toLowerCase());
   const plan = loadOpeningSnipePlan({ cwd, env });
   if (plan) return { mode, plan, source: "plan" };
-  if (mode === "MANUAL") {
+  if (mode === "MANUAL" || env.MANUAL_BUY === "1") {
     return { mode, source: "manual-env", plan: {
       pair: env.AOE_PAIR || "BNB/USDT",
       event_day: env.EVENT_DAY || new Date().toISOString().slice(0, 10),
@@ -73,7 +74,8 @@ export function resolveBuyPlan({ env = process.env, cwd = process.cwd() } = {}) 
       reason: env.REASON || "manual TARGET_TOKEN_ID override",
     }};
   }
-  throw new Error("AUTO/SMART mode requires opening_snipe_plans.json; refusing TARGET_TOKEN_ID fallback.");
+  if (requirePlan) throw new Error("AUTO/SMART mode requires opening_snipe_plans.json; refusing TARGET_TOKEN_ID fallback.");
+  throw new Error("AUTO_BUY_REQUIRE_PLAN=0 is unsupported for live AUTO buys; set MANUAL_BUY=1 for TARGET_TOKEN_ID fallback.");
 }
 
 const resolvedBuyPlan = process.env.NODE_ENV === "test"
@@ -254,6 +256,10 @@ export function approvalAmountForRouter() {
   return MAX_UINT256;
 }
 
+export function canSkipApprovalCheck(env = process.env) {
+  return env.SKIP_APPROVAL_CHECK === "1" && env.BATCH_APPROVAL_DONE === "1";
+}
+
 export function decodeRouterErrorName(data) {
   const decoded = decodeErrorResult({ abi: routerAbi, data });
   return decoded.errorName;
@@ -372,6 +378,17 @@ function extractErrorData(error) {
   return error?.data?.data || error?.data || error?.cause?.data?.data || error?.cause?.data;
 }
 
+export function classifySwapFailure({ allowance, balance, amountWei, minOut, retryQuote }) {
+  if (allowance != null && BigInt(allowance) < BigInt(amountWei ?? 0n)) return "funding_revert";
+  if (balance != null && BigInt(balance) < BigInt(amountWei ?? 0n)) return "funding_revert";
+  if (retryQuote?.otToUser != null && minOut != null && BigInt(retryQuote.otToUser) < BigInt(minOut)) return "quote_or_slippage_revert";
+  return "router_revert";
+}
+
+export function fourByteLink(selector) {
+  return selector ? `https://www.4byte.directory/signatures/?bytes4_signature=${selector.slice(0, 10)}` : undefined;
+}
+
 export function buildSwapFailureDiagnostics({
   error,
   initialQuote,
@@ -382,6 +399,15 @@ export function buildSwapFailureDiagnostics({
   blockNumber,
   marketStatus,
   deadline,
+  marketAddress,
+  tokenId,
+  amountWei,
+  mode,
+  allowance,
+  balance,
+  graphPrice,
+  effectivePrice,
+  nonce,
 }) {
   const errorData = extractErrorData(error);
   let routerError;
@@ -396,6 +422,18 @@ export function buildSwapFailureDiagnostics({
     Object.entries({
       router_error: routerError,
       router_error_data: typeof errorData === "string" ? errorData : undefined,
+      selector: typeof errorData === "string" ? errorData.slice(0, 10) : undefined,
+      fourbyte: typeof errorData === "string" ? fourByteLink(errorData) : undefined,
+      category: classifySwapFailure({ allowance, balance, amountWei, minOut, retryQuote }),
+      market: marketAddress,
+      token_id: stringifyBigInt(tokenId),
+      amount: stringifyBigInt(amountWei),
+      mode,
+      allowance: stringifyBigInt(allowance),
+      balance: stringifyBigInt(balance),
+      graph_price: graphPrice,
+      effective_price: effectivePrice,
+      nonce,
       initial_quote_out: stringifyBigInt(initialQuote?.otToUser),
       retry_quote_out: stringifyBigInt(retryQuote?.otToUser),
       initial_pool_price_pre: stringifyBigInt(initialQuote?.prePrice),
@@ -578,6 +616,10 @@ export function shouldPrefetchApproval(market, nowMs = Date.now(), preApprovalMs
 }
 
 async function approveIfNeeded(publicClient, walletClient, account, amountWei) {
+  if (canSkipApprovalCheck()) {
+    console.log("Batch approval completed by runner; skipping child allowance check.");
+    return true;
+  }
   const allowance = await publicClient.readContract({
     address: config.collateral,
     abi: erc20Abi,
@@ -600,8 +642,8 @@ async function approveIfNeeded(publicClient, walletClient, account, amountWei) {
     }),
   );
   console.log("Approve tx:", approveHash);
-  await publicClient.waitForTransactionReceipt({ hash: approveHash });
-  return true;
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: approveHash });
+  return receipt?.status === "success";
 }
 
 export async function applyGasPriceOverride(publicClient, request, multiplierBps = config.gasPriceMultiplierBps) {
@@ -996,6 +1038,7 @@ async function main() {
       effective_price: effectivePrice,
       max_price: config.maxPrice,
       ot_out: quote.otToUser.toString(),
+      quote_out: quote.otToUser.toString(),
       min_out: minOut.toString(),
       slippage_bps: Number(config.slippageBps),
       error: JSON.stringify(confirmation),
@@ -1019,6 +1062,7 @@ async function main() {
     graph_price: graphPrice,
     max_price: config.maxPrice,
     ot_out: quote.otToUser.toString(),
+    quote_out: quote.otToUser.toString(),
     min_out: minOut.toString(),
     slippage_bps: Number(config.slippageBps),
     gas_usdt: Number(formatUnits(gasWei, 18)) * Number(process.env.BNB_USDT_PRICE || "680"),

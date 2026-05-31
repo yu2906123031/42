@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import { createPublicClient, http, fallback } from "viem";
+import { createPublicClient, createWalletClient, http, fallback, parseUnits } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { bsc } from "viem/chains";
 import { runAutoClaim } from "./aoe-auto-claim.js";
@@ -37,6 +37,41 @@ const DRY_RUN = ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_
 const SCAN_INTERVAL_MS = Math.max(5_000, Number(process.env.AUTO_BUY_SCAN_INTERVAL_MS || "60000"));
 const LOOP_ONCE = ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_ONCE || "0").toLowerCase());
 const FORCE_BUY = ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_FORCE || "0").toLowerCase());
+
+const COLLATERAL = "0x55d398326f99059ff775485246999027b3197955";
+const ROUTER = "0x888888886619275d33c00D3BC62DF94D700DCD42";
+const ERC20_ABI = [
+  { type: "function", name: "allowance", stateMutability: "view", inputs: [{ name: "owner", type: "address" }, { name: "spender", type: "address" }], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "approve", stateMutability: "nonpayable", inputs: [{ name: "spender", type: "address" }, { name: "amount", type: "uint256" }], outputs: [{ type: "bool" }] },
+];
+const MAX_UINT256 = (1n << 256n) - 1n;
+
+function shouldApproveRouter(allowance, amountWei) {
+  return BigInt(allowance ?? 0n) < BigInt(amountWei ?? 0n);
+}
+
+function approvalAmountForRouter() {
+  return MAX_UINT256;
+}
+
+export function totalBuyAmountWei(pairs, amounts = AMOUNTS, decimals = 18) {
+  return pairs.reduce((total, pair) => total + parseUnits(String(amounts[pair] || amounts["BNB/USDT"] || "0"), decimals), 0n);
+}
+
+export async function preflightAllowanceForBatch({ publicClient, walletClient, account, pairs = PAIRS, amounts = AMOUNTS, dryRun = DRY_RUN, logFn = console.log } = {}) {
+  if (!account) return { approved: false, skipped: true, reason: "missing_account" };
+  const totalAmount = totalBuyAmountWei(pairs, amounts);
+  const allowance = await publicClient.readContract({ address: COLLATERAL, abi: ERC20_ABI, functionName: "allowance", args: [account.address, ROUTER] });
+  if (!shouldApproveRouter(allowance, totalAmount)) return { approved: true, allowance, totalAmount, approvalSent: false };
+  if (dryRun) {
+    logFn(`DRY RUN: batch allowance ${allowance} below total buy amount ${totalAmount}; would approve MAX_UINT256.`);
+    return { approved: true, allowance, totalAmount, approvalSent: false, dryRun: true };
+  }
+  const hash = await walletClient.writeContract({ address: COLLATERAL, abi: ERC20_ABI, functionName: "approve", args: [ROUTER, approvalAmountForRouter()] });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt?.status !== "success") return { approved: false, allowance, totalAmount, approvalSent: true, hash, receipt };
+  return { approved: true, allowance, totalAmount, approvalSent: true, hash, receipt };
+}
 
 export class NonceManager {
   constructor(startNonce) { this.nextNonce = Number(startNonce); }
@@ -150,6 +185,7 @@ function runBuy(pair, market, { nonce } = {}) {
     MAX_PRICE: process.env.AUTO_MAX_OUTCOME_PRICE || process.env.AUTO_BUY_MAX_PRICE || process.env.MAX_PRICE || "0.45",
     OPENING_EXECUTION_MODE: process.env.OPENING_EXECUTION_MODE || "HYBRID",
     ...(nonce == null ? {} : { BUY_NONCE: String(nonce) }),
+    ...(process.env.BATCH_APPROVAL_DONE === "1" ? { SKIP_APPROVAL_CHECK: "1", BATCH_APPROVAL_DONE: "1" } : {}),
   };
   console.log(`[${new Date().toISOString()}] buy start pair=${pair} market=${market.market_address} nonce=${env.BUY_NONCE ?? "auto"} amount=${env.BUY_AMOUNT_USDT} dryRun=${env.DRY_RUN}`);
   return new Promise((resolve) => {
@@ -169,6 +205,15 @@ export async function runBuysConcurrently({
   logFn = console.log,
 } = {}) {
   const nonceManager = await createNonceManager();
+  if (!DRY_RUN && process.env.PRIVATE_KEY) {
+    const urls = (process.env.BSC_RPC_URLS || process.env.BSC_RPC_URL || "https://bsc-rpc.publicnode.com").split(",").map((v) => v.trim()).filter(Boolean);
+    const publicClient = createPublicClient({ chain: bsc, transport: fallback(urls.map((url) => http(url, { retryCount: 0, timeout: 8000 }))) });
+    const account = privateKeyToAccount(process.env.PRIVATE_KEY);
+    const walletClient = createWalletClient({ account, chain: bsc, transport: fallback(urls.map((url) => http(url, { retryCount: 0, timeout: 8000 }))) });
+    const approval = await preflightAllowanceForBatch({ publicClient, walletClient, account, pairs, amounts: AMOUNTS, dryRun: DRY_RUN, logFn });
+    if (!approval.approved) return pairs.map((pair) => ({ pair, status: "skipped", reason: "batch_approval_failed" }));
+    process.env.BATCH_APPROVAL_DONE = "1";
+  }
   const jobs = pairs.map(async (pair) => {
     let lock = null;
     try {

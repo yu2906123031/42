@@ -100,14 +100,14 @@ function kpi() {
     .prepare(
       `SELECT COUNT(*) AS buys, COALESCE(SUM(amount_usdt),0) AS turnover,
               COALESCE(SUM(gas_usdt),0) AS gas
-       FROM executions WHERE substr(ts,1,10)=? AND side='BUY'`,
+       FROM executions WHERE substr(ts,1,10)=? AND side='BUY' AND source IN ('aoe-onchain-buy','aoe-auto-claim')`,
     )
     .get(today);
   const monthStats = db
     .prepare(
       `SELECT COUNT(*) AS trades, COALESCE(SUM(amount_usdt),0) AS turnover,
               COALESCE(SUM(gas_usdt),0) AS gas
-       FROM executions WHERE substr(ts,1,7)=?`,
+       FROM executions WHERE substr(ts,1,7)=? AND source IN ('aoe-onchain-buy','aoe-auto-claim')`,
     )
     .get(month);
   return {
@@ -236,7 +236,7 @@ function strategy() {
               COALESCE(MIN(duration_ms),0) AS fastest_ms,
               COALESCE(MAX(duration_ms),0) AS slowest_ms
        FROM executions
-       WHERE ts >= ?
+       WHERE ts >= ? AND source IN ('aoe-onchain-buy','aoe-auto-claim')
        GROUP BY pair
        ORDER BY CASE pair WHEN 'BNB/USDT' THEN 0 WHEN 'SOL/USDT' THEN 1 ELSE 2 END`,
     )
@@ -246,7 +246,7 @@ function strategy() {
 
 function exportTrades(format) {
   const rows = db.prepare("SELECT * FROM executions ORDER BY ts DESC LIMIT 5000").all();
-  const header = ["time", "pair", "side", "amount_usdt", "price", "gas_usdt", "status", "tx_hash", "duration_ms", "source"];
+  const header = ["time", "pair", "side", "amount_usdt", "price", "gas_usdt", "status", "tx_hash", "duration_ms", "source", "market_address", "token_id", "outcome_name", "event_day", "graph_price", "effective_price", "quote_out", "min_out", "nonce", "gas_price_gwei", "plan_id"];
   const csv = [
     header.join(","),
     ...rows.map((row) =>

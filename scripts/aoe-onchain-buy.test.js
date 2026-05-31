@@ -18,9 +18,11 @@ const {
   buildWeixinBuySuccessMessage,
   resolveBuyPlan,
   assertEffectivePriceWithinMax,
+  canSkipApprovalCheck,
+  classifySwapFailure,
 } = onchain;
-const { NonceManager } = runner;
-const { initializeSchema, acquireAutoBuyLock } = store;
+const { NonceManager, preflightAllowanceForBatch } = runner;
+const { initializeSchema, acquireAutoBuyLock, recordExecution } = store;
 const { claimableBuysQuery } = claim;
 
 test("prefetches approval inside configured window before market start", () => {
@@ -149,4 +151,117 @@ test("claim query binds claims to buy_id and token_id from execution records", (
   assert.match(sql, /token_id/);
   assert.match(sql, /market_address IS NOT NULL/);
   assert.match(sql, /c\.buy_id = b\.id/);
+});
+
+
+test("batch allowance approves once when allowance is below total amount", async () => {
+  const calls = [];
+  const publicClient = {
+    readContract: async () => 1n,
+    waitForTransactionReceipt: async ({ hash }) => ({ status: "success", transactionHash: hash }),
+  };
+  const walletClient = { writeContract: async (request) => { calls.push(request); return "0xapprove"; } };
+  const result = await preflightAllowanceForBatch({
+    publicClient,
+    walletClient,
+    account: { address: "0xabc" },
+    pairs: ["BNB/USDT", "BTC/USDT"],
+    amounts: { "BNB/USDT": "5", "BTC/USDT": "2" },
+    dryRun: false,
+    logFn: () => {},
+  });
+
+  assert.equal(result.approved, true);
+  assert.equal(result.approvalSent, true);
+  assert.equal(calls.length, 1);
+});
+
+test("batch allowance blocks buys when approval receipt is not successful", async () => {
+  const publicClient = {
+    readContract: async () => 0n,
+    waitForTransactionReceipt: async () => ({ status: "reverted" }),
+  };
+  const walletClient = { writeContract: async () => "0xapprove" };
+  const result = await preflightAllowanceForBatch({
+    publicClient,
+    walletClient,
+    account: { address: "0xabc" },
+    pairs: ["BNB/USDT"],
+    amounts: { "BNB/USDT": "5" },
+    dryRun: false,
+    logFn: () => {},
+  });
+
+  assert.equal(result.approved, false);
+});
+
+test("SKIP_APPROVAL_CHECK is only honored after runner batch approval", () => {
+  assert.equal(canSkipApprovalCheck({ SKIP_APPROVAL_CHECK: "1" }), false);
+  assert.equal(canSkipApprovalCheck({ SKIP_APPROVAL_CHECK: "1", BATCH_APPROVAL_DONE: "1" }), true);
+});
+
+test("executions migration keeps old rows and adds context columns", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec(`CREATE TABLE executions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      pair TEXT NOT NULL DEFAULT 'BNB/USDT',
+      side TEXT NOT NULL DEFAULT 'BUY',
+      amount_usdt REAL NOT NULL DEFAULT 0,
+      price REAL NOT NULL DEFAULT 0,
+      gas_usdt REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      tx_hash TEXT,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'aoe',
+      error TEXT
+    );`);
+    db.prepare("INSERT INTO executions(ts,pair,side,amount_usdt,price,gas_usdt,status,tx_hash,duration_ms,source,error) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+      .run("2026-05-31T00:00:00Z", "BNB/USDT", "BUY", 1, 0.1, 0, "failed", null, 1, "aoe-onchain-buy", "old");
+    initializeSchema(db);
+    const columns = db.prepare("PRAGMA table_info(executions)").all().map((row) => row.name);
+    assert.ok(columns.includes("quote_out"));
+    assert.ok(columns.includes("plan_id"));
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM executions").get().count, 1);
+  } finally { db.close(); }
+});
+
+test("success execution without tx_hash is rejected", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aoe-db-"));
+  const old = process.env.AOE_RUNTIME_DIR;
+  process.env.AOE_RUNTIME_DIR = dir;
+  store.resetDbForTests();
+  try {
+    assert.throws(() => recordExecution({ status: "success", pair: "BNB/USDT" }), /requires tx_hash/);
+  } finally {
+    store.resetDbForTests();
+    if (old === undefined) delete process.env.AOE_RUNTIME_DIR; else process.env.AOE_RUNTIME_DIR = old;
+  }
+});
+
+test("nonce manager allocates four unique consecutive nonces", () => {
+  const manager = new NonceManager(40);
+  assert.deepEqual([...manager.allocateForPairs(["BNB/USDT", "BTC/USDT", "SOL/USDT", "ETH/USDT"]).values()], [40, 41, 42, 43]);
+});
+
+test("swap diagnostics classify quote and funding reverts", () => {
+  assert.equal(classifySwapFailure({ retryQuote: { otToUser: 10n }, minOut: 11n }), "quote_or_slippage_revert");
+  assert.equal(classifySwapFailure({ allowance: 1n, amountWei: 2n }), "funding_revert");
+});
+
+
+test("real stats exclude demo and scheduler sources", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    initializeSchema(db);
+    db.prepare("INSERT INTO executions(ts,pair,side,amount_usdt,price,gas_usdt,status,tx_hash,duration_ms,source,error) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+      .run("2026-05-31T00:00:00Z", "BNB/USDT", "BUY", 5, 0.1, 0.01, "success", "0xreal", 1, "aoe-onchain-buy", null);
+    db.prepare("INSERT INTO executions(ts,pair,side,amount_usdt,price,gas_usdt,status,tx_hash,duration_ms,source,error) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+      .run("2026-05-31T00:01:00Z", "BNB/USDT", "BUY", 100, 0.1, 0.01, "success", "0xdemo", 1, "manual", null);
+    store.rebuildDailyStats(db);
+    const row = db.prepare("SELECT trade_count, turnover_usdt FROM daily_stats WHERE day='2026-05-31'").get();
+    assert.equal(row.trade_count, 1);
+    assert.equal(row.turnover_usdt, 5);
+  } finally { db.close(); }
 });

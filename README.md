@@ -45,4 +45,8 @@ AOE_BUY_MODE=MANUAL DRY_RUN=1 \
 
 并发自动买入使用 `NonceManager` 从 pending nonce 或 `BASE_BUY_NONCE` 分配连续 nonce；`auto_buy_locks` 按 `event_day + pair` 加锁，`AUTO_BUY_FORCE=1` 才会覆盖。`OPENING_EXECUTION_MODE=HYBRID` 为默认模式，`FAST_PRESIGN` 会启用开盘预签名。
 
+Runner 在真实买入前会按本轮全部 pair 的 `buy_amount_usdt` 做一次 USDT allowance preflight。allowance 不足时只提交一次 Router `approve(MAX_UINT256)`，receipt 成功后子进程才会跳过各自的 allowance 检查。
+
+成交记录会写入 market/token/outcome/event_day、nonce、graph/effective price、quote/minOut、plan_id 等上下文；`success` / `confirmed` 记录必须带 `tx_hash`。Dashboard 的实时 KPI、strategy 汇总和 `daily_stats` 只统计 `aoe-onchain-buy` / `aoe-auto-claim` 来源，demo、manual、scheduler 行通过 source 保留在明细中。
+
 Dashboard 写接口支持 `AOE_DASHBOARD_WRITE_TOKEN`：设置后，`POST /api/config` 与 `POST /api/executions` 必须携带 `x-aoe-dashboard-token`。CORS 默认限制到 localhost，可用 `AOE_DASHBOARD_ALLOWED_ORIGINS` 覆盖。
