@@ -27,23 +27,43 @@ function logItem(level, message) {
   return { id: crypto.randomUUID(), ts: new Date().toISOString(), level, message };
 }
 
-function json(res, status, payload) {
+const allowedOrigins = (process.env.AOE_DASHBOARD_ALLOWED_ORIGINS || "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8787,http://127.0.0.1:8787")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+function corsHeaders(req) {
+  const origin = req.headers.origin;
+  const allowOrigin = origin && allowedOrigins.includes(origin) ? origin : allowedOrigins[0] || "http://localhost:8787";
+  return {
+    "access-control-allow-origin": allowOrigin,
+    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-headers": "content-type,x-aoe-dashboard-token",
+    "vary": "Origin",
+  };
+}
+
+function json(req, res, status, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type",
+    ...corsHeaders(req),
   });
   res.end(body);
 }
 
-function text(res, status, body, contentType = "text/plain; charset=utf-8") {
+function text(req, res, status, body, contentType = "text/plain; charset=utf-8") {
   res.writeHead(status, {
     "content-type": contentType,
-    "access-control-allow-origin": "*",
+    ...corsHeaders(req),
   });
   res.end(body);
+}
+
+function requireWriteToken(req) {
+  const token = process.env.AOE_DASHBOARD_WRITE_TOKEN;
+  if (!token) return true;
+  return req.headers["x-aoe-dashboard-token"] === token;
 }
 
 function readBody(req) {
@@ -249,40 +269,42 @@ function clampPageSize(value, allowed, fallback) {
 
 const server = http.createServer(async (req, res) => {
   try {
-    if (req.method === "OPTIONS") return json(res, 204, {});
+    if (req.method === "OPTIONS") return json(req, res, 204, {});
     const url = new URL(req.url || "/", `http://${req.headers.host}`);
-    if (req.method === "GET" && url.pathname === "/api/kpi") return json(res, 200, kpi());
-    if (req.method === "GET" && url.pathname === "/api/config") return json(res, 200, config);
+    if (req.method === "GET" && url.pathname === "/api/kpi") return json(req, res, 200, kpi());
+    if (req.method === "GET" && url.pathname === "/api/config") return json(req, res, 200, config);
     if (req.method === "POST" && url.pathname === "/api/config") {
+      if (!requireWriteToken(req)) return json(req, res, 401, { error: "Unauthorized" });
       config = { ...config, ...(await readBody(req)) };
       logs.unshift(logItem("INFO", `Config updated: ${config.pairs.join(", ")}`));
-      return json(res, 200, config);
+      return json(req, res, 200, config);
     }
-    if (req.method === "GET" && url.pathname === "/api/runtime") return json(res, 200, runtime());
+    if (req.method === "GET" && url.pathname === "/api/runtime") return json(req, res, 200, runtime());
     if (req.method === "GET" && url.pathname === "/api/logs") {
-      return json(res, 200, { items: logs.slice(0, 200) });
+      return json(req, res, 200, { items: logs.slice(0, 200) });
     }
-    if (req.method === "GET" && url.pathname === "/api/markets") return json(res, 200, markets(url));
-    if (req.method === "GET" && url.pathname === "/api/analytics") return json(res, 200, analytics(url));
-    if (req.method === "GET" && url.pathname === "/api/trades") return json(res, 200, trades(url));
-    if (req.method === "GET" && url.pathname === "/api/strategy") return json(res, 200, strategy());
+    if (req.method === "GET" && url.pathname === "/api/markets") return json(req, res, 200, markets(url));
+    if (req.method === "GET" && url.pathname === "/api/analytics") return json(req, res, 200, analytics(url));
+    if (req.method === "GET" && url.pathname === "/api/trades") return json(req, res, 200, trades(url));
+    if (req.method === "GET" && url.pathname === "/api/strategy") return json(req, res, 200, strategy());
     if (req.method === "GET" && url.pathname === "/api/export.csv") {
       const out = exportTrades("csv");
-      return text(res, 200, out.body, out.type);
+      return text(req, res, 200, out.body, out.type);
     }
     if (req.method === "GET" && url.pathname === "/api/export.xls") {
       const out = exportTrades("excel");
-      return text(res, 200, out.body, out.type);
+      return text(req, res, 200, out.body, out.type);
     }
     if (req.method === "POST" && url.pathname === "/api/executions") {
+      if (!requireWriteToken(req)) return json(req, res, 401, { error: "Unauthorized" });
       const item = recordExecution(await readBody(req));
       logs.unshift(logItem(item.status === "success" ? "BUY" : "ERROR", `${item.pair} ${item.status} ${item.tx_hash || item.error || ""}`));
-      return json(res, 201, item);
+      return json(req, res, 201, item);
     }
-    return json(res, 404, { error: "Not found" });
+    return json(req, res, 404, { error: "Not found" });
   } catch (error) {
     logs.unshift(logItem("ERROR", error.message));
-    return json(res, 500, { error: error.message });
+    return json(req, res, 500, { error: error.message });
   }
 });
 

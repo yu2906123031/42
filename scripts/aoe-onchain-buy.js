@@ -32,6 +32,54 @@ function loadDotEnv(path = ".env") {
 
 loadDotEnv();
 
+export function loadOpeningSnipePlan({ cwd = process.cwd(), env = process.env } = {}) {
+  const candidates = [env.OPENING_SNIPE_PLAN_PATH, "runtime-state/opening_snipe_plans.json", "opening_snipe_plans.json"].filter(Boolean);
+  for (const candidate of candidates) {
+    const file = candidate.startsWith("/") ? candidate : `${cwd}/${candidate}`;
+    if (!fs.existsSync(file)) continue;
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    const plans = Array.isArray(parsed) ? parsed : parsed.plans || [parsed];
+    const pair = env.AOE_PAIR || env.PAIR;
+    const eventDay = env.EVENT_DAY;
+    const plan = plans.find((item) => (!pair || item.pair === pair) && (!eventDay || item.event_day === eventDay)) || plans[0];
+    validateOpeningSnipePlan(plan);
+    return plan;
+  }
+  return null;
+}
+
+export function validateOpeningSnipePlan(plan) {
+  const required = ["pair", "event_day", "market_address", "selected_token_id", "outcome_name", "buy_amount_usdt", "max_price", "confidence", "reason"];
+  for (const key of required) {
+    if (plan?.[key] === undefined || plan?.[key] === null || plan?.[key] === "") throw new Error(`opening_snipe_plan missing ${key}`);
+  }
+  return true;
+}
+
+export function resolveBuyPlan({ env = process.env, cwd = process.cwd() } = {}) {
+  const mode = (env.AOE_BUY_MODE || env.BUY_MODE || "AUTO").toUpperCase();
+  const plan = loadOpeningSnipePlan({ cwd, env });
+  if (plan) return { mode, plan, source: "plan" };
+  if (mode === "MANUAL") {
+    return { mode, source: "manual-env", plan: {
+      pair: env.AOE_PAIR || "BNB/USDT",
+      event_day: env.EVENT_DAY || new Date().toISOString().slice(0, 10),
+      market_address: env.MARKET_ADDRESS,
+      selected_token_id: env.TARGET_TOKEN_ID,
+      outcome_name: env.TARGET_OUTCOME || "AOE",
+      buy_amount_usdt: env.BUY_AMOUNT_USDT || "10",
+      max_price: env.MAX_PRICE || "0.0015",
+      confidence: env.CONFIDENCE || "manual",
+      reason: env.REASON || "manual TARGET_TOKEN_ID override",
+    }};
+  }
+  throw new Error("AUTO/SMART mode requires opening_snipe_plans.json; refusing TARGET_TOKEN_ID fallback.");
+}
+
+const resolvedBuyPlan = process.env.NODE_ENV === "test"
+  ? { mode: "TEST", source: "test", plan: { pair: "TEST/USDT", event_day: "1970-01-01", market_address: "0x0000000000000000000000000000000000000001", selected_token_id: "1", outcome_name: "TEST", buy_amount_usdt: "1", max_price: "1", confidence: "test", reason: "test import guard" } }
+  : resolveBuyPlan();
+
 const OFFICIAL_BSC_RPC_URLS = [
   "https://bsc-rpc.publicnode.com",
   "https://bsc.meowrpc.com",
@@ -56,18 +104,19 @@ const config = {
   rpcUrls: rpcCandidates(),
   privateKey: process.env.PRIVATE_KEY,
   marketAddress:
-    process.env.MARKET_ADDRESS || "0xfFb5Ce7060E6CE733EaBcb984dA7B47a721184bd",
-  targetOutcome: process.env.TARGET_OUTCOME || "AOE",
-  targetTokenId: BigInt(process.env.TARGET_TOKEN_ID || "4"),
-  buyAmount: process.env.BUY_AMOUNT_USDT || "10",
+    resolvedBuyPlan.plan.market_address || process.env.MARKET_ADDRESS,
+  targetOutcome: resolvedBuyPlan.plan.outcome_name || process.env.TARGET_OUTCOME || "AOE",
+  targetTokenId: BigInt(resolvedBuyPlan.plan.selected_token_id),
+  buyAmount: String(resolvedBuyPlan.plan.buy_amount_usdt),
   dryRun: process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true",
   dryRunMaxWaitMs: Number(process.env.DRY_RUN_MAX_WAIT_MS || "10000"),
   pollMs: Number(process.env.POLL_MS || "500"),
   preApprovalMs: Number(process.env.PRE_APPROVAL_MS || "10000"),
-  maxPrice: Number(process.env.MAX_PRICE || "0.0015"),
+  maxPrice: Number(process.env.MAX_PRICE || resolvedBuyPlan.plan.max_price || "0.0015"),
   slippageBps: parseSlippageBps(process.env.SLIPPAGE_BPS),
   gasPriceMultiplierBps: BigInt(process.env.GAS_PRICE_MULTIPLIER_BPS || "15000"),
-  preSignOpeningTx: shouldPreSignOpeningTx(process.env.PRE_SIGN_OPENING_TX),
+  openingExecutionMode: (process.env.OPENING_EXECUTION_MODE || "HYBRID").toUpperCase(),
+  preSignOpeningTx: (process.env.OPENING_EXECUTION_MODE || "HYBRID").toUpperCase() === "FAST_PRESIGN" || shouldPreSignOpeningTx(process.env.PRE_SIGN_OPENING_TX),
   preSignGasLimit: BigInt(process.env.PRE_SIGN_GAS_LIMIT || "650000"),
   rawTxFanoutLimit: Number(process.env.RAW_TX_FANOUT_LIMIT || "0"),
   collateral: "0x55d398326f99059ff775485246999027b3197955",
@@ -693,9 +742,26 @@ function swapArgs(account, amountWei, minOut, simGuess) {
   ];
 }
 
+export function effectivePriceFromQuote(quote, collateralDecimals = config.collateralDecimals, otDecimals = config.otDecimals) {
+  const collateral = Number(formatUnits(quote.collateralFromUser, collateralDecimals));
+  const ot = Number(formatUnits(quote.otToUser, otDecimals));
+  return collateral / Math.max(ot, 1e-18);
+}
+
+export function assertEffectivePriceWithinMax({ quote, maxPrice, collateralDecimals = config.collateralDecimals, otDecimals = config.otDecimals }) {
+  const effectivePrice = effectivePriceFromQuote(quote, collateralDecimals, otDecimals);
+  if (effectivePrice > Number(maxPrice)) {
+    const error = new Error(`Abort: effectivePrice ${effectivePrice} > maxPrice ${maxPrice}`);
+    error.effectivePrice = effectivePrice;
+    throw error;
+  }
+  return effectivePrice;
+}
+
 async function prepareSignedSwapTransaction({ publicClient, account, amountWei, minOut, simGuess, gasPrice }) {
+  const envNonce = process.env.BUY_NONCE;
   const [nonce, blockGasPrice] = await Promise.all([
-    publicClient.getTransactionCount({ address: account.address, blockTag: "pending" }),
+    envNonce != null && envNonce !== "" ? Promise.resolve(Number(envNonce)) : publicClient.getTransactionCount({ address: account.address, blockTag: "pending" }),
     gasPrice == null ? publicClient.getGasPrice() : Promise.resolve(gasPrice),
   ]);
   const data = encodeFunctionData({
@@ -729,12 +795,17 @@ async function recordSwapFailure({ error, initialQuote, retryQuote, minOut, retr
   });
   console.error("Swap simulation diagnostics:", JSON.stringify(diagnostics));
   await recordExecutionIfNeeded({
-    pair: process.env.AOE_PAIR || "BNB/USDT",
+    pair: process.env.AOE_PAIR || resolvedBuyPlan.plan.pair || "BNB/USDT",
     side: "BUY",
     amount_usdt: Number(config.buyAmount || 0),
     status: "failed",
     duration_ms: Date.now() - startedAt,
     source: "aoe-onchain-buy",
+    market_address: config.marketAddress,
+    token_id: config.targetTokenId.toString(),
+    outcome_name: config.targetOutcome,
+    event_day: resolvedBuyPlan.plan.event_day,
+    gas_price_gwei: gasPrice == null ? null : Number(formatUnits(gasPrice, 9)),
     error: JSON.stringify({ message: error.message, diagnostics }),
   });
   return diagnostics;
@@ -788,6 +859,8 @@ async function main() {
   console.log("Receiver:", account.address);
   console.log("Watching market:", config.marketAddress);
   console.log("Target:", config.targetOutcome, "token_id", config.targetTokenId);
+  console.log("Plan:", `selected_token_id=${config.targetTokenId}`, `outcome_name=${config.targetOutcome}`, `confidence=${resolvedBuyPlan.plan.confidence}`, `reason=${resolvedBuyPlan.plan.reason}`);
+  console.log("Opening execution mode:", config.openingExecutionMode);
   if (config.preSignOpeningTx && !config.dryRun) {
     console.log("Raw tx broadcast fanout:", rawTxBroadcastClients.map((client) => client.name).join(", "));
   }
@@ -833,8 +906,11 @@ async function main() {
   const simGuess = encodeDataGuess(0n, 100n, smartSimEps(Number(config.buyAmount)));
   const quote = await simulateMintQuote(publicClient, amountWei, simGuess);
   let minOut = minOutFromQuote(quote.otToUser, config.slippageBps);
+  const graphPrice = Number(liveState.outcome?.price_hmr ?? 0);
+  const effectivePrice = assertEffectivePriceWithinMax({ quote, maxPrice: config.maxPrice });
   console.log("Simulated OT out:", formatUnits(quote.otToUser, config.otDecimals));
   console.log("Min OT out:", formatUnits(minOut, config.otDecimals));
+  console.log("Price check:", `graph_price=${graphPrice}`, `effective_price=${effectivePrice}`, `max_price=${config.maxPrice}`);
 
   const [gasPrice, blockNumber] = await Promise.all([
     publicClient.getGasPrice(),
@@ -903,13 +979,25 @@ async function main() {
     const confirmation = describeTransactionReceiptStatus(null, error, hash);
     console.error("Confirmation diagnostics:", JSON.stringify(confirmation));
     await recordExecutionIfNeeded({
-      pair: process.env.AOE_PAIR || "BNB/USDT",
+      pair: process.env.AOE_PAIR || resolvedBuyPlan.plan.pair || "BNB/USDT",
       side: "BUY",
       amount_usdt: Number(config.buyAmount || 0),
       status: "pending",
       tx_hash: hash,
       duration_ms: Date.now() - startedAt,
       source: "aoe-onchain-buy",
+      market_address: config.marketAddress,
+      token_id: config.targetTokenId.toString(),
+      outcome_name: config.targetOutcome,
+      event_day: resolvedBuyPlan.plan.event_day,
+      nonce: signedSwap?.nonce,
+      gas_price_gwei: Number(formatUnits(signedSwap?.gasPrice ?? gasPrice, 9)),
+      graph_price: graphPrice,
+      effective_price: effectivePrice,
+      max_price: config.maxPrice,
+      ot_out: quote.otToUser.toString(),
+      min_out: minOut.toString(),
+      slippage_bps: Number(config.slippageBps),
       error: JSON.stringify(confirmation),
     });
     throw error;
@@ -923,15 +1011,25 @@ async function main() {
       ? receipt.gasUsed * receipt.effectiveGasPrice
       : 0n;
   const executionPayload = {
-    pair: process.env.AOE_PAIR || "BNB/USDT",
+    pair: process.env.AOE_PAIR || resolvedBuyPlan.plan.pair || "BNB/USDT",
     side: "BUY",
     amount_usdt: Number(formatUnits(quote.collateralFromUser, config.collateralDecimals)),
-    price: Number(formatUnits(quote.collateralFromUser, config.collateralDecimals)) /
-      Math.max(Number(formatUnits(quote.otToUser, config.otDecimals)), 1e-12),
+    price: effectivePrice,
+    effective_price: effectivePrice,
+    graph_price: graphPrice,
+    max_price: config.maxPrice,
+    ot_out: quote.otToUser.toString(),
+    min_out: minOut.toString(),
+    slippage_bps: Number(config.slippageBps),
     gas_usdt: Number(formatUnits(gasWei, 18)) * Number(process.env.BNB_USDT_PRICE || "680"),
     status: receipt.status === "success" ? "success" : "failed",
     tx_hash: receipt.transactionHash,
-    token_id: config.targetTokenId,
+    market_address: config.marketAddress,
+    token_id: config.targetTokenId.toString(),
+    outcome_name: config.targetOutcome,
+    event_day: resolvedBuyPlan.plan.event_day,
+    nonce: signedSwap?.nonce,
+    gas_price_gwei: Number(formatUnits(signedSwap?.gasPrice ?? gasPrice, 9)),
     duration_ms: Date.now() - startedAt,
     source: "aoe-onchain-buy",
   };
@@ -950,12 +1048,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
     try {
       await recordExecutionIfNeeded({
-        pair: process.env.AOE_PAIR || "BNB/USDT",
+        pair: process.env.AOE_PAIR || resolvedBuyPlan.plan.pair || "BNB/USDT",
         side: "BUY",
         amount_usdt: Number(config.buyAmount || 0),
         status: "failed",
         duration_ms: 0,
         source: "aoe-onchain-buy",
+        market_address: config.marketAddress,
+        token_id: config.targetTokenId.toString(),
+        outcome_name: config.targetOutcome,
+        event_day: resolvedBuyPlan.plan.event_day,
         error: error.message,
       });
     } catch (recordError) {

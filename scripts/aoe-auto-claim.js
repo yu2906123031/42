@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
   createPublicClient,
@@ -77,17 +78,19 @@ const marketAbi = [
 
 export function claimableBuysQuery() {
   return `
-    SELECT id, ts, pair, amount_usdt, tx_hash
+    SELECT id, ts, pair, amount_usdt, tx_hash, market_address, token_id, outcome_name, event_day
     FROM executions b
     WHERE side = 'BUY'
       AND status IN ('success', 'confirmed')
       AND ts >= ?
+      AND market_address IS NOT NULL
+      AND token_id IS NOT NULL
       AND NOT EXISTS (
         SELECT 1 FROM executions c
         WHERE c.side = 'CLAIM'
           AND c.status IN ('success', 'confirmed')
           AND c.source = 'aoe-auto-claim'
-          AND c.error = 'buy_id=' || b.id
+          AND c.buy_id = b.id
       )
     ORDER BY ts ASC
   `;
@@ -104,7 +107,7 @@ export function isWinningOutcome(market, tokenId) {
 }
 
 export function shouldClaimBuy(buy, market) {
-  return isMarketFinalised(market) && isWinningOutcome(market, buy.target_token_id ?? config.targetTokenId);
+  return isMarketFinalised(market) && isWinningOutcome(market, buy.token_id ?? buy.target_token_id ?? config.targetTokenId);
 }
 
 function ordinal(day) {
@@ -165,12 +168,13 @@ async function clients(account) {
 }
 
 function claimableBuys() {
-  const database = new DatabaseSync("runtime-state/trades.db", { readOnly: true });
+  const runtimeDir = path.resolve(process.env.AOE_RUNTIME_DIR || "runtime-state");
+  const database = new DatabaseSync(path.join(runtimeDir, "trades.db"), { readOnly: true });
   const since = new Date(Date.now() - config.lookbackDays * 86400000).toISOString();
   try {
     return database.prepare(claimableBuysQuery()).all(since).map((buy) => ({
       ...buy,
-      target_token_id: config.targetTokenId,
+      target_token_id: buy.token_id || config.targetTokenId.toString(),
     }));
   } finally {
     database.close();
@@ -178,11 +182,12 @@ function claimableBuys() {
 }
 
 async function claimOne({ buy, market, account, publicClient, walletClient }) {
+  const tokenId = BigInt(buy.token_id ?? buy.target_token_id ?? config.targetTokenId);
   const balance = await publicClient.readContract({
     address: market.market_address,
     abi: marketAbi,
     functionName: "balanceOf",
-    args: [account.address, config.targetTokenId],
+    args: [account.address, tokenId],
   });
   if (balance <= 0n) {
     console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} reason=no_ot_balance`);
@@ -197,11 +202,11 @@ async function claimOne({ buy, market, account, publicClient, walletClient }) {
     console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} market=${market.market_address} reason=market_not_finalised_onchain answer=${state.answer.toString()}`);
     return;
   }
-  if (BigInt(state.answer) !== config.targetTokenId) {
-    console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} market=${market.market_address} reason=target_not_winning answer=${state.answer.toString()} target=${config.targetTokenId.toString()}`);
+  if (BigInt(state.answer) !== tokenId) {
+    console.log(`[${new Date().toISOString()}] claim skip pair=${buy.pair} buy_id=${buy.id} market=${market.market_address} reason=target_not_winning answer=${state.answer.toString()} target=${tokenId.toString()}`);
     return;
   }
-  const outcome = market.outcomes.find((item) => BigInt(item.token_id) === config.targetTokenId);
+  const outcome = market.outcomes.find((item) => BigInt(item.token_id) === tokenId);
   const estimatedPayout = Number(formatUnits(balance, 18)) * Number(outcome?.payout_hmr || 0);
   console.log(`[${new Date().toISOString()}] claim ready pair=${buy.pair} buy_id=${buy.id} market=${market.market_address} ot=${formatUnits(balance, 18)} est_usdt=${estimatedPayout.toFixed(6)} dryRun=${config.dryRun}`);
   if (config.dryRun) return;
@@ -212,7 +217,7 @@ async function claimOne({ buy, market, account, publicClient, walletClient }) {
     address: market.market_address,
     abi: marketAbi,
     functionName: "claim",
-    args: [account.address, [config.targetTokenId], [balance]],
+    args: [account.address, [tokenId], [balance]],
   });
   const hash = await walletClient.writeContract(request);
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
@@ -224,7 +229,12 @@ async function claimOne({ buy, market, account, publicClient, walletClient }) {
     tx_hash: receipt.transactionHash,
     duration_ms: Date.now() - startedAt,
     source: "aoe-auto-claim",
-    error: `buy_id=${buy.id}`,
+    buy_id: buy.id,
+    market_address: market.market_address,
+    token_id: tokenId.toString(),
+    outcome_name: buy.outcome_name || outcome?.name || null,
+    event_day: buy.event_day || null,
+    error: null,
   });
   console.log(`[${new Date().toISOString()}] claim finished pair=${buy.pair} buy_id=${buy.id} tx=${receipt.transactionHash} status=${receipt.status}`);
 }

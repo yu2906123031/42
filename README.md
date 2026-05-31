@@ -30,14 +30,19 @@ PRIVATE_KEY=0x...
 
 可选配置：
 
-```env
-AUTO_MODE=SMART
-PRIMARY_BUY_USDT=5
-SECONDARY_BUY_USDT=0
-AUTO_MAX_OUTCOME_PRICE=0.45
-MIN_CONFIDENCE=60
-AUTO_SKIP_IF_DAILY_VOL_BELOW=100000000
-AUTO_SKIP_IF_DAILY_VOL_ABOVE=1000000000
-OPENING_SNIPE_MODE=true
-OPENING_SNIPE_WINDOW_MINUTES=30
+## 安全执行模式
+
+自动买入默认使用 `AOE_BUY_MODE=AUTO`，脚本会读取 `runtime-state/opening_snipe_plans.json`，并把链上 `market_address`、`selected_token_id`、`outcome_name`、`buy_amount_usdt`、`max_price` 绑定到同一个计划。AUTO/SMART 模式缺少计划文件时会直接退出，避免回退到过期的 `TARGET_TOKEN_ID`。
+
+人工验证时使用：
+
+```bash
+AOE_BUY_MODE=MANUAL DRY_RUN=1 \
+  MARKET_ADDRESS=0xfFb5Ce7060E6CE733EaBcb984dA7B47a721184bd \
+  TARGET_OUTCOME=AOE TARGET_TOKEN_ID=4 BUY_AMOUNT_USDT=0 MAX_PRICE=1 \
+  npm run buy:aoe:onchain
 ```
+
+并发自动买入使用 `NonceManager` 从 pending nonce 或 `BASE_BUY_NONCE` 分配连续 nonce；`auto_buy_locks` 按 `event_day + pair` 加锁，`AUTO_BUY_FORCE=1` 才会覆盖。`OPENING_EXECUTION_MODE=HYBRID` 为默认模式，`FAST_PRESIGN` 会启用开盘预签名。
+
+Dashboard 写接口支持 `AOE_DASHBOARD_WRITE_TOKEN`：设置后，`POST /api/config` 与 `POST /api/executions` 必须携带 `x-aoe-dashboard-token`。CORS 默认限制到 localhost，可用 `AOE_DASHBOARD_ALLOWED_ORIGINS` 覆盖。

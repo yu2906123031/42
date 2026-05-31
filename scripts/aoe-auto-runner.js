@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { createPublicClient, http, fallback } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { bsc } from "viem/chains";
 import { runAutoClaim } from "./aoe-auto-claim.js";
+import { acquireAutoBuyLock, updateAutoBuyLock } from "./aoe-dashboard-store.js";
 
 function loadDotEnv(path = ".env") {
   if (!fs.existsSync(path)) return;
@@ -32,6 +36,25 @@ const ENABLED = ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_
 const DRY_RUN = ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_DRY_RUN || process.env.DRY_RUN || "0").toLowerCase());
 const SCAN_INTERVAL_MS = Math.max(5_000, Number(process.env.AUTO_BUY_SCAN_INTERVAL_MS || "60000"));
 const LOOP_ONCE = ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_ONCE || "0").toLowerCase());
+const FORCE_BUY = ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_FORCE || "0").toLowerCase());
+
+export class NonceManager {
+  constructor(startNonce) { this.nextNonce = Number(startNonce); }
+  allocate() { const nonce = this.nextNonce; this.nextNonce += 1; return nonce; }
+  allocateForPairs(pairs) { return new Map(pairs.map((pair) => [pair, this.allocate()])); }
+}
+
+async function createNonceManager() {
+  if (DRY_RUN) return null;
+  if (process.env.BASE_BUY_NONCE) return new NonceManager(Number(process.env.BASE_BUY_NONCE));
+  if (!process.env.PRIVATE_KEY) return null;
+  const urls = (process.env.BSC_RPC_URLS || process.env.BSC_RPC_URL || "https://bsc-rpc.publicnode.com").split(",").map((v) => v.trim()).filter(Boolean);
+  const publicClient = createPublicClient({ chain: bsc, transport: fallback(urls.map((url) => http(url, { retryCount: 0, timeout: 8000 }))) });
+  const account = privateKeyToAccount(process.env.PRIVATE_KEY);
+  const pending = await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
+  console.log(`[${new Date().toISOString()}] NonceManager base pending nonce=${pending}`);
+  return new NonceManager(pending);
+}
 const MARKET_QUERY = `
 query DiscoverMarket($pattern: String!) {
   home_market_list(where: { title: { _ilike: $pattern } }, limit: 20) {
@@ -116,16 +139,19 @@ function log(message, logFn = console.log) {
   logFn(`[${new Date().toISOString()}] ${message}`);
 }
 
-function runBuy(pair, market) {
+function runBuy(pair, market, { nonce } = {}) {
   const env = {
     ...process.env,
     AOE_PAIR: pair,
     MARKET_ADDRESS: market.market_address,
+    EVENT_DAY: market.event_day,
     BUY_AMOUNT_USDT: AMOUNTS[pair] || AMOUNTS["BNB/USDT"] || "5",
     DRY_RUN: DRY_RUN ? "true" : "false",
     MAX_PRICE: process.env.AUTO_MAX_OUTCOME_PRICE || process.env.AUTO_BUY_MAX_PRICE || process.env.MAX_PRICE || "0.45",
+    OPENING_EXECUTION_MODE: process.env.OPENING_EXECUTION_MODE || "HYBRID",
+    ...(nonce == null ? {} : { BUY_NONCE: String(nonce) }),
   };
-  console.log(`[${new Date().toISOString()}] buy start pair=${pair} market=${market.market_address} amount=${env.BUY_AMOUNT_USDT} dryRun=${env.DRY_RUN}`);
+  console.log(`[${new Date().toISOString()}] buy start pair=${pair} market=${market.market_address} nonce=${env.BUY_NONCE ?? "auto"} amount=${env.BUY_AMOUNT_USDT} dryRun=${env.DRY_RUN}`);
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ["scripts/aoe-onchain-buy.js"], { env, stdio: "inherit" });
     child.on("exit", (code, signal) => {
@@ -142,7 +168,9 @@ export async function runBuysConcurrently({
   runBuyFn = runBuy,
   logFn = console.log,
 } = {}) {
+  const nonceManager = await createNonceManager();
   const jobs = pairs.map(async (pair) => {
+    let lock = null;
     try {
       const market = await discoverMarketFn(pair, eventDate);
       if (!market) {
@@ -150,10 +178,19 @@ export async function runBuysConcurrently({
         return { pair, status: "skipped", reason: "market_not_found" };
       }
       log(`discovered pair=${pair} status=${market.status} market=${market.market_address} title=${market.title}`, logFn);
-      const code = await runBuyFn(pair, market);
+      lock = acquireAutoBuyLock({ pair, event_day: market.event_day || eventDate.toISOString().slice(0, 10), market_address: market.market_address, force: FORCE_BUY });
+      if (!lock.acquired) {
+        log(`buy skipped pair=${pair} reason=${lock.reason} market=${market.market_address}`, logFn);
+        return { pair, status: "skipped", reason: lock.reason, market: market.market_address };
+      }
+      const nonce = nonceManager?.allocate();
+      updateAutoBuyLock(lock.lockId, { status: "running", nonce });
+      const code = await runBuyFn(pair, market, { nonce });
       const status = buyStatusFromCode(code);
-      return { pair, status, code, market: market.market_address };
+      updateAutoBuyLock(lock.lockId, { status, nonce });
+      return { pair, status, code, market: market.market_address, nonce };
     } catch (error) {
+      if (lock?.lockId) updateAutoBuyLock(lock.lockId, { status: "failed", error: error.message });
       log(`buy failed pair=${pair} error=${error.message}`, logFn);
       return { pair, status: "failed", error: error.message };
     }
