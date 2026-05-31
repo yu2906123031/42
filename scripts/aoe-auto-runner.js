@@ -5,6 +5,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { bsc } from "viem/chains";
 import { runAutoClaim } from "./aoe-auto-claim.js";
 import { acquireAutoBuyLock, updateAutoBuyLock } from "./aoe-dashboard-store.js";
+import { generateOpeningSnipePlans } from "./aoe-opening-plan-generator.js";
 
 function loadDotEnv(path = ".env") {
   if (!fs.existsSync(path)) return;
@@ -259,12 +260,26 @@ export async function runBuysConcurrently({
   return Promise.all(jobs);
 }
 
-async function runCycle() {
-  const eventDate = eventDateForScan();
-  console.log(`[${new Date().toISOString()}] discovering markets for UTC ${eventDate.toISOString().slice(0, 10)}`);
-  const results = await runBuysConcurrently({ eventDate });
+export async function runCycle({
+  eventDate = eventDateForScan(),
+  generatePlansFn = generateOpeningSnipePlans,
+  runBuysConcurrentlyFn = runBuysConcurrently,
+  logFn = console.log,
+} = {}) {
+  const eventDay = eventDate.toISOString().slice(0, 10);
+  logFn(`[${new Date().toISOString()}] generating opening plans for UTC ${eventDay}`);
+  const generated = await generatePlansFn({ env: { ...process.env, EVENT_DAY: process.env.EVENT_DAY || eventDay }, logFn });
+  const plannedPairs = new Set((generated?.plans || []).map((plan) => plan.pair));
+  const pairs = PAIRS.filter((pair) => plannedPairs.has(pair));
+  if (!pairs.length) {
+    logFn(`[${new Date().toISOString()}] no opening plans generated; skipping buy cycle`);
+    return [];
+  }
+  logFn(`[${new Date().toISOString()}] discovering markets for UTC ${eventDay} plannedPairs=${pairs.join(",")}`);
+  const results = await runBuysConcurrentlyFn({ eventDate, pairs, logFn });
   const summary = summarizeBuyResults(results);
-  console.log(`[${new Date().toISOString()}] buy cycle summary total=${summary.total} success=${summary.success} failed=${summary.failed} skipped=${summary.skipped}`);
+  logFn(`[${new Date().toISOString()}] buy cycle summary total=${summary.total} success=${summary.success} failed=${summary.failed} skipped=${summary.skipped}`);
+  return results;
 }
 
 async function main() {

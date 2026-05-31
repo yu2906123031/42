@@ -11,6 +11,7 @@ const onchain = await import("./aoe-onchain-buy.js");
 const runner = await import("./aoe-auto-runner.js");
 const store = await import("./aoe-dashboard-store.js");
 const claim = await import("./aoe-auto-claim.js");
+const generator = await import("./aoe-opening-plan-generator.js");
 
 const {
   shouldPrefetchApproval,
@@ -26,6 +27,7 @@ const {
 const { NonceManager, preflightAllowanceForBatch } = runner;
 const { initializeSchema, acquireAutoBuyLock, updateAutoBuyLock, recordExecution } = store;
 const { claimableBuysQuery } = claim;
+const { parseOutcomeRange, estimateDailyVolume, selectOutcome, generateOpeningSnipePlans } = generator;
 
 test("prefetches approval inside configured window before market start", () => {
   const startTimestamp = 1_700_000_010;
@@ -302,6 +304,77 @@ test("swap diagnostics classify quote and funding reverts", () => {
   assert.equal(classifySwapFailure({ allowance: 1n, amountWei: 2n }), "funding_revert");
 });
 
+
+test("parseOutcomeRange supports compact and open volume ranges", () => {
+  assert.deepEqual(parseOutcomeRange({ token_id: "1", name: "$100B - $200B", price_hmr: "0.3" }), {
+    token_id: "1", outcome_name: "$100B - $200B", lower: 100_000_000_000, upper: 200_000_000_000, price_hmr: 0.3,
+  });
+  assert.equal(parseOutcomeRange({ token_id: "2", name: "Below 100M", price_hmr: "0.2" }).upper, 100_000_000);
+  assert.equal(parseOutcomeRange({ token_id: "3", name: ">300K", price_hmr: "0.2" }).lower, 300_000);
+  assert.equal(parseOutcomeRange({ token_id: "4", name: "100,000,000,000 - 200,000,000,000", price_hmr: "0.2" }).upper, 200_000_000_000);
+});
+
+test("estimateDailyVolume combines mocked Binance volume inputs", async () => {
+  const fetchFn = async (url) => ({
+    ok: true,
+    json: async () => {
+      if (url.includes("ticker/24hr")) return { quoteVolume: "1000" };
+      if (url.includes("interval=1d")) return Array.from({ length: 8 }, (_, i) => [0, 0, 0, 0, 0, 0, 0, String(i === 7 ? 600 : 700)]);
+      if (url.includes("interval=1h")) return Array.from({ length: 24 }, (_, i) => [0, 0, 0, 0, 0, 0, 0, String(i === 23 ? 20 : 10)]);
+      throw new Error(url);
+    },
+  });
+  const estimate = await estimateDailyVolume("BNB/USDT", { fetchFn, now: new Date("2026-06-01T12:00:00Z") });
+  assert.equal(estimate.recent7d_avg, 700);
+  assert.equal(estimate.current_24h_volume, 1000);
+  assert.ok(estimate.predicted_volume > 900 && estimate.predicted_volume < 1200);
+});
+
+test("selectOutcome chooses containing range and respects price/confidence gates", () => {
+  const outcomes = [
+    { token_id: "1", outcome_name: "0-100", lower: 0, upper: 100, price_hmr: 0.2 },
+    { token_id: "2", outcome_name: "100-200", lower: 100, upper: 200, price_hmr: 0.3 },
+  ];
+  assert.equal(selectOutcome(outcomes, { predicted_volume: 150, data_complete: true }, { maxPrice: 0.45 }).token_id, "2");
+  assert.equal(selectOutcome(outcomes, { predicted_volume: 150, data_complete: true }, { maxPrice: 0.25, minConfidence: 0 })?.token_id, "1");
+  assert.equal(selectOutcome(outcomes, { predicted_volume: 150, data_complete: true }, { maxPrice: 0.1 }), null);
+  assert.equal(selectOutcome(outcomes, { predicted_volume: 99, data_complete: false }, { maxPrice: 0.45, minConfidence: 95 }), null);
+});
+
+test("generator outputs plans array from mocked GraphQL and Binance data", async () => {
+  const fetchFn = async (url, options) => ({
+    ok: true,
+    json: async () => {
+      if (options?.method === "POST") return { data: { home_market_list: [{ title: "BNB/USDT Futures Daily Volume, June 1st", status: "live", market_address: "0xabc", outcomes: [
+        { token_id: "1", name: "Below 1000", price_hmr: "0.2" },
+        { token_id: "2", name: "1000 - 2000", price_hmr: "0.3" },
+      ] }] } };
+      if (url.includes("ticker/24hr")) return { quoteVolume: "1200" };
+      if (url.includes("interval=1d")) return Array.from({ length: 8 }, (_, i) => [0, 0, 0, 0, 0, 0, 0, String(i === 7 ? 600 : 1000)]);
+      if (url.includes("interval=1h")) return Array.from({ length: 24 }, () => [0, 0, 0, 0, 0, 0, 0, "10"]);
+      throw new Error(url);
+    },
+  });
+  const payload = await generateOpeningSnipePlans({
+    env: { AUTO_BUY_PAIRS: "BNB/USDT", EVENT_DAY: "2026-06-01", PLAN_DRY_RUN: "1" },
+    fetchFn,
+    now: new Date("2026-06-01T12:00:00Z"),
+    logFn: () => {},
+  });
+  assert.equal(payload.plans.length, 1);
+  assert.equal(payload.plans[0].selected_token_id, "2");
+});
+
+test("runner invokes opening plan generator before buys", async () => {
+  const calls = [];
+  await runner.runCycle({
+    eventDate: new Date("2026-06-01T00:00:00Z"),
+    generatePlansFn: async () => { calls.push("generate"); return { plans: [{ pair: "BNB/USDT" }] }; },
+    runBuysConcurrentlyFn: async () => { calls.push("buy"); return []; },
+    logFn: () => {},
+  });
+  assert.deepEqual(calls, ["generate", "buy"]);
+});
 
 test("real stats exclude demo and scheduler sources", () => {
   const db = new DatabaseSync(":memory:");

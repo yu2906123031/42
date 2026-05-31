@@ -32,7 +32,22 @@ PRIVATE_KEY=0x...
 
 ## 安全执行模式
 
+开盘买入链路采用 plan-driven 执行：
+
+- `scripts/aoe-opening-plan-generator.js` 负责发现当天 Futures Daily Volume market，读取 Binance Futures 24h、1d、1h 成交额数据，预测 UTC 日成交额并生成 `runtime-state/opening_snipe_plans.json`。
+- `scripts/aoe-auto-runner.js` 负责发现市场、先生成 plan、批量授权、按已有 plan 并发执行；某个 pair 没有生成 plan 时，该 pair 会被跳过。
+- `scripts/aoe-onchain-buy.js` 只负责按 plan 里的 `market_address`、`selected_token_id`、`outcome_name`、`buy_amount_usdt`、`max_price` 精确买入。
+
 自动买入默认使用 `AOE_BUY_MODE=AUTO`，脚本会读取 `runtime-state/opening_snipe_plans.json`，并把链上 `market_address`、`selected_token_id`、`outcome_name`、`buy_amount_usdt`、`max_price` 绑定到同一个计划。AUTO/SMART 模式缺少计划文件时会直接退出，避免回退到过期的 `TARGET_TOKEN_ID`。
+
+手动生成开盘 plan：
+
+```bash
+PLAN_DRY_RUN=1 npm run plan:aoe:opening
+npm run plan:aoe:opening
+```
+
+常用 plan 配置：`AUTO_BUY_PAIRS`、`EVENT_DAY`、`GRAPHQL_URL`、`BINANCE_FAPI_URL`、`OPENING_SNIPE_PLAN_PATH`、`PLAN_MIN_CONFIDENCE`、`PLAN_MAX_PRICE`、`PLAN_ALLOW_LOW_CONFIDENCE`、`PRIMARY_BUY_USDT`、`BTC_BUY_USDT`、`SOL_BUY_USDT`、`ETH_BUY_USDT`。
 
 人工验证时使用：
 
@@ -47,9 +62,9 @@ AOE_BUY_MODE=MANUAL DRY_RUN=1 \
 
 `OPENING_EXECUTION_MODE` 支持三种安全执行模式：
 
-- `HYBRID`：默认模式，先链上 quote/simulate，再提交交易；旧的 `PRE_SIGN_OPENING_TX` 在该模式下不会触发预签。只有明确设置 `HYBRID_PRESIGN_AFTER_QUOTE=1` 时，quote 之后才会走预签广播。
+- `HYBRID`：默认模式，先链上 quote/simulate，再提交交易；旧的 `PRE_SIGN_OPENING_TX` 在该模式下不会触发预签。只有明确设置 `HYBRID_PRESIGN_AFTER_QUOTE=1` 时，quote 之后才会走预签广播。实盘推荐使用该模式。
 - `SAFE_SIMULATE`：全程模拟优先，强制关闭预签，适合实盘前验证与保守运行。
-- `FAST_PRESIGN`：开盘前准备签名交易并在条件满足时广播，适合抢开盘成交，需配合更严格的计划、价格与 nonce 管理。
+- `FAST_PRESIGN`：开盘前准备签名交易并在条件满足时广播，适合抢开盘成交，需配合更严格的计划、价格与 nonce 管理；确认 plan 和 allowance 长期稳定后再启用。
 
 Runner 在真实买入前会按本轮全部 pair 的 `buy_amount_usdt` 做一次 USDT allowance preflight。allowance 不足时只提交一次 Router `approve(MAX_UINT256)`，receipt 成功后会向子进程传递 `BATCH_APPROVAL_DONE`、`BATCH_APPROVAL_OWNER`、`BATCH_APPROVAL_TOTAL_WEI`、`BATCH_APPROVAL_TX`；子进程仅在 owner 匹配且本单金额被总额度覆盖时跳过 allowance 检查。
 
