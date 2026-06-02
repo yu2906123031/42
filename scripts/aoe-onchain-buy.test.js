@@ -23,6 +23,8 @@ const {
   classifySwapFailure,
   shouldPreSignOpeningTx,
   shouldUsePreSign,
+  statusForConfirmationTimeout,
+  shouldExitNonZeroForReceiptStatus,
 } = onchain;
 const { NonceManager, preflightAllowanceForBatch } = runner;
 const { initializeSchema, acquireAutoBuyLock, updateAutoBuyLock, recordExecution } = store;
@@ -579,6 +581,40 @@ test("runner uses generated plan amounts and max prices for buy orchestration", 
   });
   assert.equal(received.amounts["BNB/USDT"], "11");
   assert.equal(received.maxPrices["BNB/USDT"], "0.22");
+});
+
+test("default automatic buy amounts are 2U for every supported pair", () => {
+  const amounts = runner.defaultAutoBuyAmounts({});
+  assert.deepEqual(amounts, {
+    "BNB/USDT": "2",
+    "BTC/USDT": "2",
+    "SOL/USDT": "2",
+    "ETH/USDT": "2",
+  });
+});
+
+test("runBuy fallback amount is 2U when no pair amount is configured", async () => {
+  let childEnv;
+  const spawnFn = (_execPath, _args, options) => {
+    childEnv = options.env;
+    return { on: (_event, cb) => cb(0, null) };
+  };
+  await runner.runBuy("BNB/USDT", { market_address: "0xabc", event_day: "2026-06-01" }, {
+    amounts: {},
+    spawnFn,
+    logFn: () => {},
+  });
+  assert.equal(childEnv.BUY_AMOUNT_USDT, "2");
+});
+
+test("confirmation timeout with transaction absent on chain records failed status", () => {
+  assert.equal(statusForConfirmationTimeout({ transactionFound: false }), "failed");
+  assert.equal(statusForConfirmationTimeout({ transactionFound: true }), "pending");
+});
+
+test("reverted transaction receipt should make onchain buy child exit non-zero", () => {
+  assert.equal(shouldExitNonZeroForReceiptStatus("success"), false);
+  assert.equal(shouldExitNonZeroForReceiptStatus("reverted"), true);
 });
 
 test("runBuy passes per-plan amount and max price to onchain child", async () => {

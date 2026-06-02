@@ -68,7 +68,7 @@ export function resolveBuyPlan({ env = process.env, cwd = process.cwd() } = {}) 
       market_address: env.MARKET_ADDRESS,
       selected_token_id: env.TARGET_TOKEN_ID,
       outcome_name: env.TARGET_OUTCOME || "AOE",
-      buy_amount_usdt: env.BUY_AMOUNT_USDT || "10",
+      buy_amount_usdt: env.BUY_AMOUNT_USDT || "2",
       max_price: env.MAX_PRICE || "0.0015",
       confidence: env.CONFIDENCE || "manual",
       reason: env.REASON || "manual TARGET_TOKEN_ID override",
@@ -385,6 +385,29 @@ export function describeTransactionReceiptStatus(receipt, error, fallbackHash) {
   };
 }
 
+export function statusForConfirmationTimeout({ transactionFound } = {}) {
+  return transactionFound ? "pending" : "failed";
+}
+
+export function shouldExitNonZeroForReceiptStatus(status) {
+  return status !== "success";
+}
+
+function markExecutionRecorded(error) {
+  error.executionRecorded = true;
+  return error;
+}
+
+export async function hasOnchainTransaction(publicClient, hash) {
+  if (!hash) return false;
+  try {
+    const transaction = await publicClient.getTransaction({ hash });
+    return Boolean(transaction);
+  } catch {
+    return false;
+  }
+}
+
 export function minOutFromQuote(otToUser, slippageBps) {
   return (BigInt(otToUser) * (10_000n - BigInt(slippageBps))) / 10_000n;
 }
@@ -471,9 +494,6 @@ export function buildSwapFailureDiagnostics({
 }
 
 export function chooseSwapQuoteAfterSimulationFailure({ originalMinOut, retryQuote, slippageBps }) {
-  if (BigInt(retryQuote.otToUser) < BigInt(originalMinOut)) {
-    return { shouldRetrySwap: false, reason: "retry_quote_below_original_min_out" };
-  }
   return {
     shouldRetrySwap: true,
     quote: retryQuote,
@@ -1040,11 +1060,13 @@ async function main() {
   } catch (error) {
     const confirmation = describeTransactionReceiptStatus(null, error, hash);
     console.error("Confirmation diagnostics:", JSON.stringify(confirmation));
+    const transactionFound = await hasOnchainTransaction(publicClient, hash);
+    const executionStatus = statusForConfirmationTimeout({ transactionFound });
     await recordExecutionIfNeeded({
       pair: process.env.AOE_PAIR || resolvedBuyPlan.plan.pair || "BNB/USDT",
       side: "BUY",
       amount_usdt: Number(config.buyAmount || 0),
-      status: "pending",
+      status: executionStatus,
       tx_hash: hash,
       duration_ms: Date.now() - startedAt,
       source: "aoe-onchain-buy",
@@ -1063,7 +1085,7 @@ async function main() {
       slippage_bps: Number(config.slippageBps),
       error: JSON.stringify(confirmation),
     });
-    throw error;
+    throw markExecutionRecorded(error);
   }
   const confirmation = describeTransactionReceiptStatus(receipt);
   console.log("Confirmation diagnostics:", JSON.stringify(confirmation));
@@ -1101,12 +1123,19 @@ async function main() {
   if (receipt.status === "success") {
     await sendWeixinBuySuccessNotificationIfNeeded(executionPayload);
   }
+  if (shouldExitNonZeroForReceiptStatus(receipt.status)) {
+    throw markExecutionRecorded(new Error(`Buy transaction reverted on chain: ${receipt.transactionHash}`));
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(async (error) => {
     console.error(error);
     if (config.dryRun) {
+      process.exitCode = 1;
+      return;
+    }
+    if (error?.executionRecorded) {
       process.exitCode = 1;
       return;
     }

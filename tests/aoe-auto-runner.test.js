@@ -22,6 +22,9 @@ test("runBuysConcurrently starts all discovered market buys before awaiting comp
       starts.push(pair);
       return new Promise((resolve) => releases.push(() => resolve(pair === "BTC/USDT" ? 1 : 0)));
     },
+    acquireLock: false,
+    preflightBatchApproval: false,
+    nonceManager: { allocate: () => undefined },
     logFn: () => {},
   });
 
@@ -44,6 +47,9 @@ test("runBuysConcurrently isolates one market failure and keeps other buys", asy
       if (pair === "BNB/USDT") throw new Error("router MarketNotStarted");
       return 0;
     },
+    acquireLock: false,
+    preflightBatchApproval: false,
+    nonceManager: { allocate: () => undefined },
     logFn: () => {},
   });
 

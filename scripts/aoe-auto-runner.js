@@ -27,12 +27,15 @@ const PAIRS = (process.env.AUTO_BUY_PAIRS || "BNB/USDT,BTC/USDT,SOL/USDT,ETH/USD
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
-const AMOUNTS = {
-  "BNB/USDT": process.env.PRIMARY_BUY_USDT || process.env.AUTO_BUY_AMOUNT_USDT || "5",
-  "BTC/USDT": process.env.BTC_BUY_USDT || "2",
-  "SOL/USDT": process.env.SOL_BUY_USDT || "2",
-  "ETH/USDT": process.env.ETH_BUY_USDT || "2",
-};
+export function defaultAutoBuyAmounts(env = process.env) {
+  return {
+    "BNB/USDT": env.PRIMARY_BUY_USDT || env.BNB_BUY_USDT || env.AUTO_BUY_AMOUNT_USDT || "2",
+    "BTC/USDT": env.PRIMARY_BUY_USDT || env.BTC_BUY_USDT || env.AUTO_BUY_AMOUNT_USDT || "2",
+    "SOL/USDT": env.PRIMARY_BUY_USDT || env.SOL_BUY_USDT || env.AUTO_BUY_AMOUNT_USDT || "2",
+    "ETH/USDT": env.PRIMARY_BUY_USDT || env.ETH_BUY_USDT || env.AUTO_BUY_AMOUNT_USDT || "2",
+  };
+}
+const AMOUNTS = defaultAutoBuyAmounts();
 const ENABLED = ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_ENABLED || "0").toLowerCase());
 const DRY_RUN = ["1", "true", "yes", "on"].includes(String(process.env.AUTO_BUY_DRY_RUN || process.env.DRY_RUN || "0").toLowerCase());
 const SCAN_INTERVAL_MS = Math.max(5_000, Number(process.env.AUTO_BUY_SCAN_INTERVAL_MS || "60000"));
@@ -176,7 +179,7 @@ function log(message, logFn = console.log) {
 }
 
 export function runBuy(pair, market, { nonce, batchApproval, amounts = AMOUNTS, maxPrices = {}, spawnFn = spawn, logFn = console.log } = {}) {
-  const buyAmount = amounts[pair] || amounts["BNB/USDT"] || "5";
+  const buyAmount = amounts[pair] || amounts["BNB/USDT"] || "2";
   const maxPrice = maxPrices[pair] || process.env.AUTO_MAX_OUTCOME_PRICE || process.env.AUTO_BUY_MAX_PRICE || process.env.MAX_PRICE || "0.45";
   const env = {
     ...process.env,
@@ -213,11 +216,14 @@ export async function runBuysConcurrently({
   eventDate = eventDateForScan(),
   discoverMarketFn = discoverMarket,
   runBuyFn = runBuy,
+  acquireLock = !DRY_RUN,
+  preflightBatchApproval = !DRY_RUN && Boolean(process.env.PRIVATE_KEY),
+  nonceManager = null,
   logFn = console.log,
 } = {}) {
-  const nonceManager = await createNonceManager();
+  nonceManager ??= await createNonceManager();
   let batchApproval = null;
-  if (!DRY_RUN && process.env.PRIVATE_KEY) {
+  if (preflightBatchApproval) {
     const urls = (process.env.BSC_RPC_URLS || process.env.BSC_RPC_URL || "https://bsc-rpc.publicnode.com").split(",").map((v) => v.trim()).filter(Boolean);
     const publicClient = createPublicClient({ chain: bsc, transport: fallback(urls.map((url) => http(url, { retryCount: 0, timeout: 8000 }))) });
     const account = privateKeyToAccount(process.env.PRIVATE_KEY);
@@ -244,16 +250,18 @@ export async function runBuysConcurrently({
         return { pair, status: "skipped", reason: "market_not_found" };
       }
       log(`discovered pair=${pair} status=${market.status} market=${market.market_address} title=${market.title}`, logFn);
-      lock = acquireAutoBuyLock({ pair, event_day: market.event_day || eventDate.toISOString().slice(0, 10), market_address: market.market_address, force: FORCE_BUY });
-      if (!lock.acquired) {
-        log(`buy skipped pair=${pair} reason=${lock.reason} market=${market.market_address}`, logFn);
-        return { pair, status: "skipped", reason: lock.reason, market: market.market_address };
+      if (acquireLock) {
+        lock = acquireAutoBuyLock({ pair, event_day: market.event_day || eventDate.toISOString().slice(0, 10), market_address: market.market_address, force: FORCE_BUY });
+        if (!lock.acquired) {
+          log(`buy skipped pair=${pair} reason=${lock.reason} market=${market.market_address}`, logFn);
+          return { pair, status: "skipped", reason: lock.reason, market: market.market_address };
+        }
       }
       const nonce = nonceManager?.allocate();
-      updateAutoBuyLock(lock.lockId, { status: "running", nonce });
+      if (lock?.lockId) updateAutoBuyLock(lock.lockId, { status: "running", nonce });
       const code = await runBuyFn(pair, market, { nonce, batchApproval, amounts, maxPrices });
       const status = buyStatusFromCode(code);
-      updateAutoBuyLock(lock.lockId, { status, nonce, error: status === "failed" ? `child_exit_${code}` : null });
+      if (lock?.lockId) updateAutoBuyLock(lock.lockId, { status, nonce, error: status === "failed" ? `child_exit_${code}` : null });
       return { pair, status, code, market: market.market_address, nonce };
     } catch (error) {
       if (lock?.lockId) updateAutoBuyLock(lock.lockId, { status: "failed", error: error.message });

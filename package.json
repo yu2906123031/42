@@ -7,6 +7,7 @@
     "buy:aoe:onchain": "node scripts/aoe-onchain-buy.js",
     "auto:buy": "node scripts/aoe-auto-runner.js",
     "plan:aoe:opening": "node scripts/aoe-opening-plan-generator.js",
+    "scan:tail": "node scripts/aoe-tail-market-scan.js",
     "test": "node --test scripts/*.test.js",
     "test:aoe:roundtrip": "node scripts/aoe-roundtrip-test.js",
     "dashboard:api": "node scripts/aoe-dashboard-server.js"

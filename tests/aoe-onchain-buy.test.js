@@ -54,6 +54,9 @@ test("swap failure diagnostics include quote, minOut, market, gas, block and dec
   assert.deepEqual(diagnostics, {
     router_error: "MarketNotStarted",
     router_error_data: "0x774620b8",
+    selector: "0x774620b8",
+    fourbyte: "https://www.4byte.directory/signatures/?bytes4_signature=0x774620b8",
+    category: "quote_or_slippage_revert",
     initial_quote_out: "1000",
     retry_quote_out: "900",
     initial_pool_price_pre: "1",
@@ -80,19 +83,19 @@ test("simulate failure re-quotes and pursues when retry quote still meets the or
   assert.equal(decision.minOut, 874n);
 });
 
-test("simulate failure re-quotes and stops when retry quote is below the original minOut", () => {
+test("simulate failure re-quotes and pursues when retry quote moved below stale original minOut", () => {
   const decision = chooseSwapQuoteAfterSimulationFailure({
-    originalMinOut: 920n,
-    retryQuote: { otToUser: 900n },
+    originalMinOut: 2060949800000000000000n,
+    retryQuote: { otToUser: 1380750000000000000000n },
     slippageBps: 800n,
   });
 
-  assert.equal(decision.shouldRetrySwap, false);
-  assert.equal(decision.reason, "retry_quote_below_original_min_out");
+  assert.equal(decision.shouldRetrySwap, true);
+  assert.equal(decision.minOut, 1270290000000000000000n);
 });
 
-test("opening buy pre-signing is enabled by default and can be disabled", () => {
-  assert.equal(shouldPreSignOpeningTx(undefined), true);
+test("opening buy pre-sign flag is opt-in", () => {
+  assert.equal(shouldPreSignOpeningTx(undefined), false);
   assert.equal(shouldPreSignOpeningTx("1"), true);
   assert.equal(shouldPreSignOpeningTx("true"), true);
   assert.equal(shouldPreSignOpeningTx("0"), false);
